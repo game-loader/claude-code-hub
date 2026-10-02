@@ -100,7 +100,7 @@ const DEFAULT_PERSISTENT_SESSION_MAX_ENTRIES = 512;
 // "this endpoint does not speak WebSocket" signal and cache as unsupported.
 // 401 / 403 are NOT in this list because they reflect auth state, not
 // protocol support.
-const PROTOCOL_UNSUPPORTED_HTTP_STATUSES = new Set([400, 404, 405, 426, 501]);
+const PROTOCOL_UNSUPPORTED_HTTP_STATUSES = new Set([404, 405, 426, 501]);
 const SSE_DATA_PREFIX = new TextEncoder().encode("data: ");
 const SSE_LINE_BREAK = new TextEncoder().encode("\n");
 const SSE_EVENT_END = new TextEncoder().encode("\n\n");

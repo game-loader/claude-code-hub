@@ -84,6 +84,7 @@ import {
   isWebsocketClientRequest,
 } from "../responses-ws/eligibility";
 import { RESERVED_INTERNAL_HEADERS } from "../responses-ws/internal-secret";
+import { shouldReconnectResponsesWs } from "../responses-ws/reconnect-policy";
 import { markResponsesWsUnsupported } from "../responses-ws/unsupported-cache";
 import { tryResponsesWebsocketUpstream } from "../responses-ws/upstream-adapter";
 import { buildProxyUrl } from "../url";
@@ -4172,7 +4173,7 @@ export class ProxyForwarder {
           // private fields or cause the upstream to reject the request.
           if (requestBodyJson) {
             session.upstreamTransport = "websocket";
-            const wsResult = await tryResponsesWebsocketUpstream({
+            const wsOptions = {
               provider,
               upstreamUrl: proxyUrl,
               upstreamHeaders: processedHeaders,
@@ -4181,7 +4182,24 @@ export class ProxyForwarder {
               endpointId: responsesWsEndpointId,
               abortSignal: transportController.signal,
               onUpstreamDispatch,
-            });
+            };
+            let wsResult = await tryResponsesWebsocketUpstream(wsOptions);
+            transportController.signal.throwIfAborted();
+            if (
+              !("response" in wsResult) &&
+              !responsesWsContinuation &&
+              shouldReconnectResponsesWs(wsResult)
+            ) {
+              logger.info("ProxyForwarder: Reconnecting upstream Responses WebSocket once", {
+                providerId: provider.id,
+                endpointId: responsesWsEndpointId,
+                reason: wsResult.reason,
+              });
+              // Same body and abort signal preserve the original request deadline.
+              // The failed adapter attempt has already closed and forgotten its socket.
+              wsResult = await tryResponsesWebsocketUpstream(wsOptions);
+              transportController.signal.throwIfAborted();
+            }
 
             if ("response" in wsResult) {
               responsesWsResponse = wsResult.response;
@@ -4207,11 +4225,8 @@ export class ProxyForwarder {
               if (responsesWsContinuation) {
                 throw new ResponsesWsContinuationError(wsResult.reason);
               }
-              // Only cache when the failure proves the endpoint does not
-              // speak the WS protocol (HTTP 4xx / 501 on the upgrade). Any
-              // transient failure (network, auth, silent upstream) should
-              // re-probe on the next request rather than skipping WS for
-              // the full TTL.
+              // Record definitive protocol rejections for diagnostics only.
+              // The next eligible request still probes WS, even after HTTP fallback.
               if (wsResult.cacheableAsUnsupported) {
                 markResponsesWsUnsupported(provider.id, responsesWsEndpointId, wsResult.reason);
               }

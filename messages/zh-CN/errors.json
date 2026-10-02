@@ -1,4 +1,5 @@
 {
+  "RESPONSES_WS_CONTINUATION_LOST": "此连接上的上一轮响应已不可用。请移除 previous_response_id，并携带完整输入上下文重试。",
   "LOCAL_CAPACITY_EXCEEDED": "本地请求处理容量不足，请稍后重试。",
   "_comment": "Error messages for Chinese Simplified",
 

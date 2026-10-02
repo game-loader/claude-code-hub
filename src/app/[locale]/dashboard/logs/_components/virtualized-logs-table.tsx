@@ -46,6 +46,7 @@ import { ErrorDetailsDialog } from "./error-details-dialog";
 import { ModelDisplayWithRedirect } from "./model-display-with-redirect";
 import { ProviderChainPopover } from "./provider-chain-popover";
 import { ThinkingEffortDisplay } from "./thinking-effort-display";
+import { TransportBadge } from "./transport-badge";
 
 const BATCH_SIZE = 50;
 const ROW_HEIGHT = 52; // Estimated row height in pixels
@@ -1290,7 +1291,10 @@ export function VirtualizedLogsTable({
                               <Tooltip delayDuration={250}>
                                 <TooltipTrigger asChild>
                                   <div className="flex flex-col items-end cursor-help">
-                                    <span>{formatDuration(log.durationMs)}</span>
+                                    <div className="flex items-center gap-1.5">
+                                      <TransportBadge providerChain={log.providerChain} />
+                                      <span>{formatDuration(log.durationMs)}</span>
+                                    </div>
                                     {ttftLine && (
                                       <span className="text-muted-foreground text-[10px]">
                                         {ttftLine}

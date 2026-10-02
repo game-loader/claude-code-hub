@@ -132,6 +132,32 @@ const discoveryTrace: RoutingTraceV1 = {
   events: [],
 };
 
+test("shows the actual upstream transport beside each duration in the regular table", () => {
+  const html = renderToStaticMarkup(
+    <UsageLogsTable
+      logs={[
+        makeLog({
+          providerChain: [
+            {
+              id: 1,
+              name: "p",
+              reason: "request_success",
+              statusCode: 200,
+              upstreamTransport: "websocket",
+            },
+          ],
+        }),
+      ]}
+      total={1}
+      page={1}
+      pageSize={20}
+      onPageChange={vi.fn()}
+      isPending={false}
+    />
+  );
+  expect(html).toContain('data-upstream-transport="websocket"');
+});
+
 describe("usage-logs-table thinking effort", () => {
   test("forwards Replay provenance to the details dialog", () => {
     const html = renderToStaticMarkup(

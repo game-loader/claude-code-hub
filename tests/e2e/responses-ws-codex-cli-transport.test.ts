@@ -1576,6 +1576,55 @@ faultRun("Codex CLI through CCH WebSocket fault injection", () => {
     }
   }, 90_000);
 
+  test("recovers lost continuation state by retrying full input through the CCH tunnel", async () => {
+    if (!cchFaultHarness) throw new Error("CCH fault harness is not initialized");
+    cchFaultHarness.events.length = 0;
+    const bodies: Array<Record<string, unknown>> = [];
+    let recoverySent = false;
+    const { buildResponsesWsContinuationErrorResponse } = await import(
+      "@/app/v1/_lib/responses-ws/continuation"
+    );
+    cchFaultHarness.setResponseHandler(async ({ res, body }) => {
+      bodies.push(body);
+      if (typeof body.previous_response_id === "string" && !recoverySent) {
+        recoverySent = true;
+        const response = await buildResponsesWsContinuationErrorResponse();
+        res.writeHead(response.status, Object.fromEntries(response.headers));
+        res.end(await response.text());
+        return;
+      }
+      await writeFragmentedSse(
+        res,
+        responseEvents(`resp_cch_recovery_${bodies.length}`, body.generate !== false),
+        0
+      );
+    });
+
+    const result = await runCodex(cchFaultHarness.port, invocation, { timeoutMs: 60_000 });
+    const continuationIndex = bodies.findIndex(
+      (body) => typeof body.previous_response_id === "string"
+    );
+    expect(recoverySent).toBe(true);
+    expect(result.code).toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(responseText);
+    const recovered = bodies
+      .slice(continuationIndex + 1)
+      .find((body) => body.previous_response_id == null);
+    expect(recovered).toBeDefined();
+    const withoutItemIds = (input: unknown) =>
+      (Array.isArray(input) ? input : []).map((item: Record<string, unknown>) => {
+        const { id: _id, ...content } = item;
+        return content;
+      });
+    // Codex may prewarm with empty input, then send the user's full prompt as
+    // the first continuation. Recovery must replay both inputs in order.
+    expect(withoutItemIds(recovered?.input)).toEqual([
+      ...withoutItemIds(bodies[0]?.input),
+      ...withoutItemIds(bodies[continuationIndex]?.input),
+    ]);
+    assertNoResetWithoutClosingHandshake(result);
+  }, 70_000);
+
   test("surfaces abrupt upstream response destruction to Codex without reset noise", async () => {
     if (!cchFaultHarness) throw new Error("CCH fault harness is not initialized");
     cchFaultHarness.events.length = 0;

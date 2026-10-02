@@ -56,6 +56,13 @@
     }
   },
   "logs": {
+    "transport": {
+      "websocket": "WS",
+      "http": "HTTP",
+      "unknown": "Unknown",
+      "tooltip": "Upstream transport: {transport}",
+      "unknownTooltip": "Upstream transport was not recorded"
+    },
     "title": "Usage Logs",
     "description": "View and analyze API call records",
     "filters": {

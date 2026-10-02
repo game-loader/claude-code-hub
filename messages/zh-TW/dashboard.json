@@ -56,6 +56,13 @@
     }
   },
   "logs": {
+    "transport": {
+      "websocket": "WS",
+      "http": "HTTP",
+      "unknown": "未知",
+      "tooltip": "上游傳輸方式：{transport}",
+      "unknownTooltip": "未記錄上游傳輸方式"
+    },
     "title": "使用日誌",
     "description": "查看和分析 API 呼叫記錄",
     "filters": {

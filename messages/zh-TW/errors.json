@@ -1,4 +1,5 @@
 {
+  "RESPONSES_WS_CONTINUATION_LOST": "此連線上的上一輪回應已不可用。請移除 previous_response_id，並攜帶完整輸入上下文重試。",
   "LOCAL_CAPACITY_EXCEEDED": "本機請求處理容量不足，請稍後重試。",
   "_comment": "Error messages for Chinese Traditional",
 

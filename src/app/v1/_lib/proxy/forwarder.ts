@@ -77,6 +77,7 @@ import {
   OPENCODE_SESSION_HEADER,
   resolveAnthropicAuthHeaders,
 } from "../headers";
+import { hasResponsesWsContinuation } from "../responses-ws/continuation";
 import {
   evaluateResponsesWsEligibility,
   getResponsesWsSessionId,
@@ -116,6 +117,7 @@ import {
   isRetryableUpstreamStorageCapacityError,
   isSSLCertificateError,
   ProxyError,
+  ResponsesWsContinuationError,
   sanitizeUrl,
 } from "./errors";
 import type { ClientFormat } from "./format-mapper";
@@ -3340,6 +3342,7 @@ export class ProxyForwarder {
     if (!provider) {
       throw new Error("Provider is required");
     }
+    session.upstreamTransport = null;
     const retainForwardedBody = session.shouldPersistSessionDebugArtifacts() || isLangfuseEnabled();
 
     const resolvedCacheTtl = resolveCacheTtlPreference(
@@ -4141,9 +4144,11 @@ export class ProxyForwarder {
       (init as Record<string, unknown>).verbose = true;
 
       // OpenAI Responses WebSocket 上游尝试（仅 Codex 供应商 + 开关开启 + 客户端以 WS 接入）
-      // 若握手失败或首帧前关闭，降级到下面的 HTTP 路径；不计入熔断器。
+      // 完整请求可降级到 HTTP；连接局部的续写必须让客户端重发完整上下文。
       let responsesWsResponse: Response | null = null;
       const responsesWsEndpointId = endpointAudit?.endpointId ?? null;
+      let responsesWsContinuation = false;
+      let responsesWsContinuationChecked = false;
       try {
         const wsEligibility = await evaluateResponsesWsEligibility({
           headers: session.headers,
@@ -4151,16 +4156,22 @@ export class ProxyForwarder {
           endpointId: responsesWsEndpointId,
         });
 
+        const requestBodyJson =
+          wsEligibility.isWebsocketClient || wsEligibility.eligible
+            ? decodeRequestBodyAsJson(requestBody)
+            : null;
+        responsesWsContinuation =
+          wsEligibility.isWebsocketClient && hasResponsesWsContinuation(requestBodyJson);
+        responsesWsContinuationChecked = true;
+
         if (wsEligibility.eligible) {
           // Use the *final* outgoing body so the WS frame matches the HTTP
           // path: it has been through filterPrivateParameters() and any
           // request-filter transformations. Falling back to
           // session.request.message would skip those rewrites and could leak
           // private fields or cause the upstream to reject the request.
-          const requestBodyJson = decodeRequestBodyAsJson(requestBody);
-
           if (requestBodyJson) {
-            onUpstreamDispatch?.();
+            session.upstreamTransport = "websocket";
             const wsResult = await tryResponsesWebsocketUpstream({
               provider,
               upstreamUrl: proxyUrl,
@@ -4169,6 +4180,7 @@ export class ProxyForwarder {
               sessionId: getResponsesWsSessionId(session.headers),
               endpointId: responsesWsEndpointId,
               abortSignal: transportController.signal,
+              onUpstreamDispatch,
             });
 
             if ("response" in wsResult) {
@@ -4186,6 +4198,15 @@ export class ProxyForwarder {
                 attemptNumber: undefined,
               });
             } else {
+              if (
+                wsResult.reason === "ws_continuation_unavailable" ||
+                wsResult.reason === "ws_module_unavailable"
+              ) {
+                session.upstreamTransport = null;
+              }
+              if (responsesWsContinuation) {
+                throw new ResponsesWsContinuationError(wsResult.reason);
+              }
               // Only cache when the failure proves the endpoint does not
               // speak the WS protocol (HTTP 4xx / 501 on the upgrade). Any
               // transient failure (network, auth, silent upstream) should
@@ -4214,7 +4235,12 @@ export class ProxyForwarder {
               });
             }
           }
-        } else if (wsEligibility.isWebsocketClient && wsEligibility.downgradeReason) {
+        } else if (wsEligibility.isWebsocketClient) {
+          if (responsesWsContinuation) {
+            throw new ResponsesWsContinuationError(
+              wsEligibility.downgradeReason ?? "ws_unavailable"
+            );
+          }
           session.addProviderToChain(provider, {
             reason: "responses_ws_fallback",
             endpointId: responsesWsEndpointId,
@@ -4224,6 +4250,28 @@ export class ProxyForwarder {
           });
         }
       } catch (wsError) {
+        if (transportController.signal.aborted) {
+          throw transportController.signal.reason instanceof Error
+            ? transportController.signal.reason
+            : new DOMException("The request was aborted", "AbortError");
+        }
+        if (
+          responsesWsContinuation ||
+          (!responsesWsContinuationChecked &&
+            isWebsocketClientRequest(session.headers) &&
+            hasResponsesWsContinuation(decodeRequestBodyAsJson(requestBody)))
+        ) {
+          const error =
+            wsError instanceof ResponsesWsContinuationError
+              ? wsError
+              : new ResponsesWsContinuationError("ws_attempt_threw");
+          logger.info("ProxyForwarder: Responses WS continuation requires full-context recovery", {
+            providerId: provider.id,
+            endpointId: responsesWsEndpointId,
+            reason: error.reason,
+          });
+          throw error;
+        }
         logger.warn(
           "ProxyForwarder: Upstream Responses WebSocket attempt threw, falling back to HTTP",
           {
@@ -4239,6 +4287,7 @@ export class ProxyForwarder {
       // ⭐ 所有供应商使用 undici.request 绕过 fetch 的自动解压
       // 原因：undici fetch 无法关闭自动解压，上游可能无视 accept-encoding: identity 返回 gzip
       // 当 gzip 流被提前终止时（如连接关闭），undici Gunzip 会抛出 "TypeError: terminated"
+      session.upstreamTransport = responsesWsResponse ? "websocket" : "http";
       response = responsesWsResponse
         ? responsesWsResponse
         : useErrorTolerantFetch
@@ -4273,6 +4322,11 @@ export class ProxyForwarder {
       const releaseDispatcherId = proxyConfig?.dispatcherId ?? directConnectionDispatcherId;
       if (releaseKey && releaseDispatcherId) {
         getGlobalAgentPool().releaseAgent(releaseKey, releaseDispatcherId);
+      }
+
+      if (fetchError instanceof ResponsesWsContinuationError) {
+        cleanupCombinedSignal();
+        throw fetchError;
       }
 
       // 捕获 fetch 原始错误（网络错误、DNS 解析失败、连接失败等）
@@ -8981,6 +9035,7 @@ export class ProxyForwarder {
     );
     target.requestUrl = new URL(source.requestUrl.toString());
     target.forwardedRequestBody = source.forwardedRequestBody;
+    target.upstreamTransport = source.upstreamTransport;
     target.setCacheTtlResolved(source.getCacheTtlResolved());
     target.setContext1mApplied(source.getContext1mApplied());
 

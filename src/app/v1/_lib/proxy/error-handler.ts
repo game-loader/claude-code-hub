@@ -15,6 +15,7 @@ import { ERROR_CODES, getErrorMessageServer } from "@/lib/utils/error-messages";
 import { sanitizeErrorTextForDetail } from "@/lib/utils/upstream-error-detection";
 import { updateMessageRequestDetailsDurably } from "@/repository/message";
 import type { SystemSettings } from "@/types/system-config";
+import { buildResponsesWsContinuationErrorResponse } from "../responses-ws/continuation";
 import { deriveClientSafeUpstreamErrorMessage } from "./client-error-message";
 import { attachSessionIdToErrorResponse } from "./error-session-id";
 import {
@@ -24,6 +25,7 @@ import {
   isRateLimitError,
   ProxyError,
   type RateLimitError,
+  ResponsesWsContinuationError,
 } from "./errors";
 import { recordLocalCapacityRejection } from "./local-capacity-log";
 import { ProxyResponses } from "./responses";
@@ -173,6 +175,16 @@ function getRateLimitStatusCode(limitType: string): number {
 
 export class ProxyErrorHandler {
   static async handle(session: ProxySession, error: unknown): Promise<Response> {
+    if (error instanceof ResponsesWsContinuationError) {
+      const response = await buildResponsesWsContinuationErrorResponse();
+      ProxyErrorHandler.emitErrorTrace(session, {
+        error,
+        errorMessage: error.message,
+        statusCode: 400,
+      });
+      await ProxyErrorHandler.logErrorToDatabase(session, error.message, 400, null);
+      return await attachSessionIdToErrorResponse(session.sessionId, response);
+    }
     if (isLocalCapacityError(error)) {
       const response = await buildLocalCapacityResponse();
       ProxyErrorHandler.emitErrorTrace(session, {

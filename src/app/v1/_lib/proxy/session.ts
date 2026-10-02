@@ -186,6 +186,8 @@ export class ProxySession {
   // 派生上游会话头（x-opencode-session）用的种子：hedge/discovery 影子会话会清空 sessionId，
   // 但上游的缓存亲和仍应跟随父请求，所以单独留一份不会被清空的副本。
   upstreamSessionSeed: string | null = null;
+  /** Attempt-local transport; copied from the winning session after a race. */
+  upstreamTransport: "http" | "websocket" | null = null;
   // 客户端或补全器已建立连续身份时，单条增量请求也应参与供应商复用。
   // 内容哈希/随机降级身份仍依赖上下文长度，避免相同短提示串到同一供应商会话。
   private allowSingleTurnProviderReuse = false;
@@ -869,6 +871,7 @@ export class ProxySession {
       errorMessage?: string; // 错误信息（失败时记录）
       endpointId?: number | null;
       endpointUrl?: string;
+      upstreamTransport?: ProviderChainItem["upstreamTransport"];
       // 修复：添加新字段
       statusCode?: number; // 成功时的状态码
       statusCodeInferred?: boolean; // statusCode 是否为响应体推断
@@ -891,6 +894,13 @@ export class ProxySession {
       providerType: provider.providerType,
       endpointId: metadata?.endpointId,
       endpointUrl: metadata?.endpointUrl,
+      upstreamTransport:
+        metadata?.upstreamTransport !== undefined
+          ? metadata.upstreamTransport
+          : metadata?.reason === "hedge_loser_cancelled" ||
+              metadata?.reason === "hedge_loser_billed"
+            ? null
+            : (this.upstreamTransport ?? null),
       // 元数据
       reason: metadata?.reason,
       selectionMethod: metadata?.selectionMethod,

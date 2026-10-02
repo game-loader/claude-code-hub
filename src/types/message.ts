@@ -23,6 +23,8 @@ export interface ProviderChainItem {
   // 端点维度（记录本次请求实际使用的 baseUrl）
   endpointId?: number | null;
   endpointUrl?: string;
+  /** Actual transport used by this upstream attempt; absent on older records. */
+  upstreamTransport?: "http" | "websocket" | null;
 
   // === 选择原因（细化） ===
   reason?:

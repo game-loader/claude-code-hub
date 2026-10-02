@@ -18,6 +18,7 @@ import { createHash } from "node:crypto";
 import type WebSocketType from "ws";
 import { logger } from "@/lib/logger";
 import type { Provider } from "@/types/provider";
+import { hasResponsesWsContinuation } from "./continuation";
 import { RESERVED_INTERNAL_HEADERS } from "./internal-secret";
 import { getUpstreamPayloadTooLargeMessage } from "./payload-too-large";
 
@@ -39,6 +40,7 @@ export type UpstreamWsFallbackReason =
   | "ws_module_unavailable"
   | "ws_upgrade_rejected"
   | "ws_payload_too_large"
+  | "ws_continuation_unavailable"
   | "ws_closed_before_first_event"
   | "ws_error_pre_first_event";
 
@@ -425,6 +427,7 @@ export async function tryResponsesWebsocketUpstream(options: {
   sessionId?: string | null;
   endpointId?: number | null;
   abortSignal?: AbortSignal;
+  onUpstreamDispatch?: () => void;
 }): Promise<UpstreamWsResult> {
   const WsCtor = (await loadWsModule()) as
     | (typeof WebSocketType & { new (url: string, opts?: unknown): WebSocketType })
@@ -482,6 +485,19 @@ export async function tryResponsesWebsocketUpstream(options: {
       }
     }
   }
+
+  // store=false continuations depend on this exact connection's response cache.
+  // A new socket cannot recover that cache after eviction, a route change or a
+  // concurrent turn. Ask the client to replay full input before opening one.
+  if (!reused && options.body.store === false && hasResponsesWsContinuation(options.body)) {
+    return {
+      failed: true,
+      reason: "ws_continuation_unavailable",
+      cacheableAsUnsupported: false,
+    };
+  }
+
+  options.onUpstreamDispatch?.();
 
   if (!reused) {
     try {

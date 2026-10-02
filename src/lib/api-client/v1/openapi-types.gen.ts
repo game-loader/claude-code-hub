@@ -4407,6 +4407,10 @@ export interface operations {
                             url: string;
                             /** @description Masked provider API key. */
                             maskedKey: string;
+                            /** @description Masked New API system access token used for account balance queries, or null when not configured. */
+                            maskedNewApiAccessToken: string | null;
+                            /** @description New API user id sent with the system access token. */
+                            newApiUserId: number | null;
                             /** @description Whether the provider is enabled. */
                             isEnabled: boolean;
                             /** @description Provider routing weight. */
@@ -4722,6 +4726,10 @@ export interface operations {
                     url: string;
                     /** @description Provider API key. Write-only. */
                     key: string;
+                    /** @description New API system access token. When set, balance queries read the account balance instead of the key quota. Empty string or null clears it. Write-only. */
+                    new_api_access_token?: string | null;
+                    /** @description New API user id sent with the system access token. Required by New API releases before 2026-07. */
+                    new_api_user_id?: number | null;
                     /** @description Whether the provider is enabled. */
                     is_enabled?: boolean;
                     /** @description Provider routing weight. */
@@ -4872,6 +4880,10 @@ export interface operations {
                         url: string;
                         /** @description Masked provider API key. */
                         maskedKey: string;
+                        /** @description Masked New API system access token used for account balance queries, or null when not configured. */
+                        maskedNewApiAccessToken: string | null;
+                        /** @description New API user id sent with the system access token. */
+                        newApiUserId: number | null;
                         /** @description Whether the provider is enabled. */
                         isEnabled: boolean;
                         /** @description Provider routing weight. */
@@ -5194,6 +5206,10 @@ export interface operations {
                         url: string;
                         /** @description Masked provider API key. */
                         maskedKey: string;
+                        /** @description Masked New API system access token used for account balance queries, or null when not configured. */
+                        maskedNewApiAccessToken: string | null;
+                        /** @description New API user id sent with the system access token. */
+                        newApiUserId: number | null;
                         /** @description Whether the provider is enabled. */
                         isEnabled: boolean;
                         /** @description Provider routing weight. */
@@ -5685,6 +5701,10 @@ export interface operations {
                      * @description Provider upstream base URL.
                      */
                     url?: string;
+                    /** @description New API system access token. When set, balance queries read the account balance instead of the key quota. Empty string or null clears it. Write-only. */
+                    new_api_access_token?: string | null;
+                    /** @description New API user id sent with the system access token. Required by New API releases before 2026-07. */
+                    new_api_user_id?: number | null;
                     /** @description Whether the provider is enabled. */
                     is_enabled?: boolean;
                     /** @description Provider routing weight. */
@@ -5840,6 +5860,10 @@ export interface operations {
                         url: string;
                         /** @description Masked provider API key. */
                         maskedKey: string;
+                        /** @description Masked New API system access token used for account balance queries, or null when not configured. */
+                        maskedNewApiAccessToken: string | null;
+                        /** @description New API user id sent with the system access token. */
+                        newApiUserId: number | null;
                         /** @description Whether the provider is enabled. */
                         isEnabled: boolean;
                         /** @description Provider routing weight. */
@@ -7625,7 +7649,7 @@ export interface operations {
                              * @description Upstream protocol that produced the snapshot.
                              * @enum {string|null}
                              */
-                            source: "new-api-token-usage" | "openai-billing" | "deepseek-balance" | "kimi-balance" | "chatgpt-credits" | null;
+                            source: "new-api-token-usage" | "new-api-account" | "sub2api-usage" | "openai-billing" | "deepseek-balance" | "kimi-balance" | "chatgpt-credits" | null;
                             /** @description Remaining balance in the reported currency. */
                             balance: number | null;
                             /** @description Currency the balance is denominated in. */
@@ -7829,7 +7853,7 @@ export interface operations {
                          * @description Upstream protocol that produced the snapshot.
                          * @enum {string|null}
                          */
-                        source: "new-api-token-usage" | "openai-billing" | "deepseek-balance" | "kimi-balance" | "chatgpt-credits" | null;
+                        source: "new-api-token-usage" | "new-api-account" | "sub2api-usage" | "openai-billing" | "deepseek-balance" | "kimi-balance" | "chatgpt-credits" | null;
                         /** @description Remaining balance in the reported currency. */
                         balance: number | null;
                         /** @description Currency the balance is denominated in. */
@@ -12720,6 +12744,8 @@ export interface operations {
                         streamGateMode: "off" | "shadow" | "enforce";
                         /** @description Whether fingerprintable requests force longest-prefix affinity for provider stickiness, skipping client session id binding. */
                         affinityIgnoreClientSessionId: boolean;
+                        /** @description Whether local memory admission is enabled. When enabled, request bodies and stream gate prefixes are admitted against the available memory budget, spill to disk, and return a local 429 when capacity runs out. When disabled, they stay in memory without queuing or local 429. */
+                        enableMemoryAdmission: boolean;
                         /** @description Request replay (response caching and upstream connection reuse) override. Null follows the ENABLE_REQUEST_REPLAY environment variable. */
                         replayEnabled: boolean | null;
                         /** @description Replay completed payload reuse window in minutes. */
@@ -13010,6 +13036,8 @@ export interface operations {
                     streamGateMode?: "off" | "shadow" | "enforce";
                     /** @description Whether fingerprintable requests force longest-prefix affinity for provider stickiness, skipping client session id binding. */
                     affinityIgnoreClientSessionId?: boolean;
+                    /** @description Whether local memory admission is enabled. When enabled, request bodies and stream gate prefixes are admitted against the available memory budget, spill to disk, and return a local 429 when capacity runs out. When disabled, they stay in memory without queuing or local 429. */
+                    enableMemoryAdmission?: boolean;
                     /** @description Request replay (response caching and upstream connection reuse) override. Null follows the ENABLE_REQUEST_REPLAY environment variable. */
                     replayEnabled?: boolean | null;
                     /** @description Replay completed payload reuse window in minutes. */
@@ -13175,6 +13203,8 @@ export interface operations {
                         streamGateMode: "off" | "shadow" | "enforce";
                         /** @description Whether fingerprintable requests force longest-prefix affinity for provider stickiness, skipping client session id binding. */
                         affinityIgnoreClientSessionId: boolean;
+                        /** @description Whether local memory admission is enabled. When enabled, request bodies and stream gate prefixes are admitted against the available memory budget, spill to disk, and return a local 429 when capacity runs out. When disabled, they stay in memory without queuing or local 429. */
+                        enableMemoryAdmission: boolean;
                         /** @description Request replay (response caching and upstream connection reuse) override. Null follows the ENABLE_REQUEST_REPLAY environment variable. */
                         replayEnabled: boolean | null;
                         /** @description Replay completed payload reuse window in minutes. */

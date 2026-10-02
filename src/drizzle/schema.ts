@@ -188,6 +188,9 @@ export const providers = pgTable('providers', {
   description: text('description'),
   url: varchar('url').notNull(),
   key: varchar('key').notNull(),
+  // New API 系统访问令牌与用户 ID（可选）：配置后余额查询读取该账户余额，不再读取密钥额度
+  newApiAccessToken: varchar('new_api_access_token'),
+  newApiUserId: integer('new_api_user_id'),
   providerVendorId: integer('provider_vendor_id')
     .notNull()
     .references(() => providerVendors.id, {
@@ -1083,6 +1086,10 @@ export const systemSettings = pgTable('system_settings', {
 
   // F3b 最长前缀匹配缓存模拟开关覆写（null = 跟随环境变量 ENABLE_CACHE_EFFECTIVENESS）
   cacheEffectivenessEnabled: boolean('cache_effectiveness_enabled'),
+
+  // 内存准入（默认关闭）
+  // 开启后：请求正文与流式门控前缀按可用内存预算准入，超出时落盘或返回本地 429
+  enableMemoryAdmission: boolean('enable_memory_admission').notNull().default(false),
 
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),

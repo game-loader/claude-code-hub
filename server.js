@@ -1169,7 +1169,10 @@ async function main() {
     process.env[INTERNAL_SECRET_ENV] = randomUUID();
   }
 
-  const app = nextFactory({ dev, hostname, port });
+  // Next lazily installs its upgrade listener on the supplied HTTP server.
+  // Keep it on the private bridge so it cannot close public Responses sockets.
+  const internalServer = http.createServer();
+  const app = nextFactory({ dev, hostname, port, httpServer: internalServer });
   const handler = app.getRequestHandler();
   await app.prepare();
   // 基础加载完成后再建立单进程/worker 预算；与 Next bundle 通过 Symbol 共享实例。
@@ -1206,7 +1209,7 @@ async function main() {
 
   // WebSocket frame 必须重新进入持有客户端连接和持久上游会话的同一个 worker。
   // 私有独占 listener 无需经 IPC 复制请求正文即可保证这一不变量。
-  const internalServer = http.createServer(requestListener);
+  internalServer.on("request", requestListener);
   const internalHttpTarget = await listenOnPrivateLoopback(internalServer);
   const server = http.createServer(requestListener);
 

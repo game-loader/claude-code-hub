@@ -1604,9 +1604,9 @@ describe("tryResponsesWebsocketUpstream", () => {
     }
   });
 
-  it("classifies 401 / 5xx / network errors as NOT cacheable-unsupported", async () => {
+  it("does not classify generic 400, auth or transient failures as WS protocol rejection", async () => {
     const http = await import("node:http");
-    for (const status of [401, 503]) {
+    for (const status of [400, 401, 403, 429, 503]) {
       const httpServer = http.createServer((_req, res) => {
         res.statusCode = status;
         res.end(`status ${status}`);

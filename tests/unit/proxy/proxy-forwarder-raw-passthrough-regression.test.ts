@@ -1,4 +1,7 @@
+import { once } from "node:events";
+import type { AddressInfo } from "node:net";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { WebSocketServer } from "ws";
 
 const mocks = vi.hoisted(() => ({
   isHttp2Enabled: vi.fn(async () => false),
@@ -389,6 +392,7 @@ describe("ProxyForwarder raw passthrough regression", () => {
         reason,
       });
       expect(fetchWithoutAutoDecode).not.toHaveBeenCalled();
+      expect(mocks.tryResponsesWebsocketUpstream).toHaveBeenCalledTimes(1);
       expect(isResponsesWsUnsupported(provider.id)).toEqual({ unsupported: false });
     }
   );
@@ -616,6 +620,173 @@ describe("ProxyForwarder raw passthrough regression", () => {
     expect(await (await doForward(makeSession(), provider, provider.url)).text()).toBe(sse);
     expect(mocks.tryResponsesWebsocketUpstream).toHaveBeenCalledTimes(2);
     expect(fetchWithoutAutoDecode).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { reason: "ws_closed_before_first_event" },
+    { reason: "ws_error_pre_first_event", message: "ECONNRESET" },
+    { reason: "ws_upgrade_rejected", message: "HTTP 503 Service Unavailable" },
+  ])("reconnects a complete request once before HTTP fallback: $reason", async (failure) => {
+    const provider = createProvider();
+    const body = JSON.stringify({ model: "gpt-5.5", input: "full-context", store: false });
+    const session = createRawPassthroughSession(body);
+    const sse = 'data: {"type":"response.completed","response":{"id":"ws-reconnected"}}\n\n';
+    mocks.evaluateResponsesWsEligibility.mockResolvedValue({
+      isWebsocketClient: true,
+      eligible: true,
+    });
+    mocks.tryResponsesWebsocketUpstream
+      .mockResolvedValueOnce({ failed: true, cacheableAsUnsupported: false, ...failure })
+      .mockResolvedValueOnce({ response: new Response(sse), connected: true, reused: false });
+    const fetchWithoutAutoDecode = vi
+      .spyOn(ProxyForwarder as any, "fetchWithoutAutoDecode")
+      .mockResolvedValue(new Response("unexpected-http"));
+    const { doForward } = ProxyForwarder as unknown as {
+      doForward: (session: ProxySession, provider: Provider, baseUrl: string) => Promise<Response>;
+    };
+    expect(await (await doForward(session, provider, provider.url)).text()).toBe(sse);
+    expect(mocks.tryResponsesWebsocketUpstream).toHaveBeenCalledTimes(2);
+    const [first] = mocks.tryResponsesWebsocketUpstream.mock.calls[0];
+    const [second] = mocks.tryResponsesWebsocketUpstream.mock.calls[1];
+    expect(second.body).toEqual(JSON.parse(body));
+    expect(second.abortSignal).toBe(first.abortSignal);
+    expect(second.sessionId).toBe(first.sessionId);
+    expect(fetchWithoutAutoDecode).not.toHaveBeenCalled();
+    expect(session.upstreamTransport).toBe("websocket");
+  });
+
+  it("falls back after two WS failures and starts the next complete request with WS", async () => {
+    const provider = createProvider();
+    const body = JSON.stringify({ model: "gpt-5.5", input: "full-context", store: false });
+    const failure = {
+      failed: true,
+      reason: "ws_closed_before_first_event",
+      cacheableAsUnsupported: false,
+    };
+    const firstSession = createRawPassthroughSession(body);
+    mocks.evaluateResponsesWsEligibility.mockResolvedValue({
+      isWebsocketClient: true,
+      eligible: true,
+    });
+    mocks.tryResponsesWebsocketUpstream.mockResolvedValue(failure);
+    const fetchWithoutAutoDecode = vi
+      .spyOn(ProxyForwarder as any, "fetchWithoutAutoDecode")
+      .mockResolvedValue(new Response("http-ok"));
+    const { doForward } = ProxyForwarder as unknown as {
+      doForward: (session: ProxySession, provider: Provider, baseUrl: string) => Promise<Response>;
+    };
+    expect(await (await doForward(firstSession, provider, provider.url)).text()).toBe("http-ok");
+    expect(mocks.tryResponsesWebsocketUpstream).toHaveBeenCalledTimes(2);
+    expect(fetchWithoutAutoDecode).toHaveBeenCalledTimes(1);
+    expect(firstSession.upstreamTransport).toBe("http");
+    mocks.tryResponsesWebsocketUpstream.mockResolvedValueOnce({
+      response: new Response("ws-ok"),
+      connected: true,
+    });
+    const nextSession = createRawPassthroughSession(body);
+    expect(await (await doForward(nextSession, provider, provider.url)).text()).toBe("ws-ok");
+    expect(mocks.tryResponsesWebsocketUpstream).toHaveBeenCalledTimes(3);
+    expect(fetchWithoutAutoDecode).toHaveBeenCalledTimes(1);
+    expect(nextSession.upstreamTransport).toBe("websocket");
+  });
+
+  it("does not spend another first-event timeout before HTTP fallback", async () => {
+    const provider = createProvider();
+    const session = createRawPassthroughSession(
+      JSON.stringify({ model: "gpt-5.5", input: "full" })
+    );
+    mocks.evaluateResponsesWsEligibility.mockResolvedValue({
+      isWebsocketClient: true,
+      eligible: true,
+    });
+    mocks.tryResponsesWebsocketUpstream.mockResolvedValue({
+      failed: true,
+      reason: "ws_error_pre_first_event",
+      message: "timeout_waiting_for_first_event",
+      cacheableAsUnsupported: false,
+    });
+    const fetchWithoutAutoDecode = vi
+      .spyOn(ProxyForwarder as any, "fetchWithoutAutoDecode")
+      .mockResolvedValue(new Response("http-ok"));
+    const { doForward } = ProxyForwarder as unknown as {
+      doForward: (session: ProxySession, provider: Provider, baseUrl: string) => Promise<Response>;
+    };
+    expect(await (await doForward(session, provider, provider.url)).text()).toBe("http-ok");
+    expect(mocks.tryResponsesWebsocketUpstream).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconnects real sockets, falls back for this request, and returns to WS on the next request", async () => {
+    const adapter = await vi.importActual<
+      typeof import("@/app/v1/_lib/responses-ws/upstream-adapter")
+    >("@/app/v1/_lib/responses-ws/upstream-adapter");
+    const wss = new WebSocketServer({ port: 0 });
+    await once(wss, "listening");
+    let connections = 0;
+    const frames: Array<Record<string, unknown>> = [];
+    wss.on("connection", (socket) => {
+      const connectionNumber = ++connections;
+      socket.on("message", (raw) => {
+        frames.push(JSON.parse(raw.toString()));
+        if (connectionNumber <= 2) {
+          socket.terminate();
+          return;
+        }
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "ws-next" } }));
+      });
+    });
+    const provider = createProvider();
+    provider.url = `http://127.0.0.1:${(wss.address() as AddressInfo).port}/v1/responses`;
+    const body = JSON.stringify({ model: "gpt-5.5", store: false, input: "full-context" });
+    const makeSession = () => {
+      const session = createRawPassthroughSession(body);
+      const endpointPolicy = resolveEndpointPolicy("/v1/responses");
+      Object.assign(session, {
+        requestUrl: new URL("https://proxy.example.com/v1/responses"),
+        endpointPolicy,
+        getEndpointPolicy: vi.fn(() => endpointPolicy),
+      });
+      return session;
+    };
+    mocks.evaluateResponsesWsEligibility.mockResolvedValue({
+      isWebsocketClient: true,
+      eligible: true,
+    });
+    mocks.tryResponsesWebsocketUpstream.mockImplementation(adapter.tryResponsesWebsocketUpstream);
+    const fetchWithoutAutoDecode = vi
+      .spyOn(ProxyForwarder as any, "fetchWithoutAutoDecode")
+      .mockResolvedValue(
+        new Response('data: {"type":"response.completed","response":{"id":"http"}}\n\n', {
+          headers: { "content-type": "text/event-stream" },
+        })
+      );
+    const { doForward } = ProxyForwarder as unknown as {
+      doForward: (session: ProxySession, provider: Provider, baseUrl: string) => Promise<Response>;
+    };
+    try {
+      const first = makeSession();
+      expect(await (await doForward(first, provider, provider.url)).text()).toContain(
+        '"id":"http"'
+      );
+      expect(connections).toBe(2);
+      expect(first.upstreamTransport).toBe("http");
+      const next = makeSession();
+      expect(await (await doForward(next, provider, provider.url)).text()).toContain(
+        '"id":"ws-next"'
+      );
+      expect(connections).toBe(3);
+      expect(next.upstreamTransport).toBe("websocket");
+      expect(fetchWithoutAutoDecode).toHaveBeenCalledTimes(1);
+      expect(frames).toHaveLength(3);
+      expect(
+        frames.every(
+          (frame) => frame.input === "full-context" && frame.previous_response_id == null
+        )
+      ).toBe(true);
+    } finally {
+      adapter.clearResponsesWsSessionsForTests();
+      for (const socket of wss.clients) socket.terminate();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
   });
 
   it("remote compaction v2 将单对象 input 规范化后再透传", async () => {

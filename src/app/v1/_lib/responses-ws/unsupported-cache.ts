@@ -1,12 +1,10 @@
 /**
- * Short-TTL in-memory cache for provider endpoints known to NOT support the
- * OpenAI Responses WebSocket transport.
+ * Short-TTL diagnostic cache for provider endpoints that rejected the
+ * OpenAI Responses WebSocket protocol.
  *
- * Populated when an upstream WebSocket handshake is rejected or closes before
- * emitting any response event. Used by the forwarder to skip the WS attempt
- * and go straight to HTTP for the duration of the TTL. Not persisted to Redis
- * or disk; a process restart clears the cache (which is fine — the next
- * request simply re-probes once and re-caches if still unsupported).
+ * Definitive protocol rejections populate this cache. It never suppresses
+ * routing attempts: the next eligible request still probes WS before HTTP.
+ * Not persisted to Redis or disk; a process restart clears the diagnostics.
  */
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000;

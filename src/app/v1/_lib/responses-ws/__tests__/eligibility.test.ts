@@ -220,7 +220,7 @@ describe("evaluateResponsesWsEligibility", () => {
     expect(result.downgradeReason).toBe("setting_disabled");
   });
 
-  it("records endpoint_ws_unsupported_cached when cache flag present", async () => {
+  it("probes WS again on the next request even after a cached handshake rejection", async () => {
     isOpenaiResponsesWebsocketEnabledMock.mockResolvedValue(true);
     const provider = codexProvider(99);
     markResponsesWsUnsupported(provider.id, null, "ws_upgrade_rejected");
@@ -229,8 +229,8 @@ describe("evaluateResponsesWsEligibility", () => {
       provider,
       endpointId: null,
     });
-    expect(result.eligible).toBe(false);
-    expect(result.downgradeReason).toBe("endpoint_ws_unsupported_cached");
+    expect(result.eligible).toBe(true);
+    expect(result.downgradeReason).toBeUndefined();
   });
 
   it("returns eligible when all conditions are met", async () => {

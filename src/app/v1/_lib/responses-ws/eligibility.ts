@@ -10,13 +10,12 @@
  *     header injected by the custom Node server)
  *   - provider type is `codex`
  *   - global `enableOpenaiResponsesWebsocket` setting is on
- *   - the specific provider/endpoint is NOT in the short-TTL unsupported cache
+ * Each eligible request probes WS again, including requests following HTTP fallback.
  */
 
 import { isOpenaiResponsesWebsocketEnabled } from "@/lib/config/system-settings-cache";
 import type { Provider } from "@/types/provider";
 import { RESPONSES_WS_SESSION_HEADER, verifyInternalRequest } from "./internal-secret";
-import { isResponsesWsUnsupported } from "./unsupported-cache";
 
 export const CLIENT_TRANSPORT_HEADER = "x-cch-client-transport";
 
@@ -107,16 +106,6 @@ export async function evaluateResponsesWsEligibility(options: {
       isWebsocketClient: true,
       eligible: false,
       downgradeReason: "setting_disabled",
-      endpointId: options.endpointId ?? null,
-    };
-  }
-
-  const cache = isResponsesWsUnsupported(options.provider.id, options.endpointId);
-  if (cache.unsupported) {
-    return {
-      isWebsocketClient: true,
-      eligible: false,
-      downgradeReason: "endpoint_ws_unsupported_cached",
       endpointId: options.endpointId ?? null,
     };
   }

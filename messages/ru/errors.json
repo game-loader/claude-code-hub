@@ -1,4 +1,5 @@
 {
+  "RESPONSES_WS_CONTINUATION_LOST": "Предыдущий ответ больше недоступен в этом соединении. Повторите запрос без previous_response_id, передав полный контекст ввода.",
   "LOCAL_CAPACITY_EXCEEDED": "Недостаточно локальных ресурсов для обработки запроса. Повторите попытку позже.",
   "_comment": "Error messages for Russian",
 

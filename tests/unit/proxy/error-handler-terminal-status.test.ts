@@ -1,7 +1,13 @@
 import { Context } from "hono";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { ProxyErrorHandler } from "@/app/v1/_lib/proxy/error-handler";
-import { ProxyError, RateLimitError } from "@/app/v1/_lib/proxy/errors";
+import {
+  categorizeErrorAsync,
+  ErrorCategory,
+  ProxyError,
+  RateLimitError,
+  ResponsesWsContinuationError,
+} from "@/app/v1/_lib/proxy/errors";
 import { ProxySession } from "@/app/v1/_lib/proxy/session";
 import type { ErrorDetectionResult } from "@/lib/error-rule-detector";
 import type { Provider } from "@/types/provider";
@@ -131,6 +137,51 @@ describe("ProxyErrorHandler.handle terminal status", () => {
       verboseProviderError: false,
       passThroughUpstreamErrorMessage: false,
     });
+  });
+
+  test("preserves recoverable WS protocol errors without overrides or provider failover classification", async () => {
+    mocks.detectAsync.mockResolvedValue({
+      matched: true,
+      overrideResponse: { error: { message: "override" } },
+    } as ErrorDetectionResult);
+    const session = await createSession();
+    const error = new ResponsesWsContinuationError("ws_payload_too_large");
+    expect(await categorizeErrorAsync(error)).toBe(ErrorCategory.NON_RETRYABLE_CLIENT_ERROR);
+    const response = await ProxyErrorHandler.handle(session, error);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: {
+        type: "invalid_request_error",
+        code: "previous_response_not_found",
+        param: "previous_response_id",
+      },
+    });
+    expect(mocks.detectAsync).not.toHaveBeenCalled();
+    expect(mocks.getCachedSystemSettings).not.toHaveBeenCalled();
+    expect(mocks.emitProxyLangfuseTrace).toHaveBeenCalledWith(
+      session,
+      expect.objectContaining({ statusCode: 400 })
+    );
+  });
+
+  test("persists attempt-local transport on terminal provider-chain records", async () => {
+    const session = await createSession();
+    session.upstreamTransport = "websocket";
+    session.addProviderToChain(PROVIDER, {
+      reason: "retry_failed",
+      attemptNumber: 1,
+      statusCode: 502,
+    });
+    session.upstreamTransport = "http";
+    session.addProviderToChain(PROVIDER, {
+      reason: "retry_success",
+      attemptNumber: 2,
+      statusCode: 200,
+    });
+    expect(session.getProviderChain()).toMatchObject([
+      { reason: "retry_failed", upstreamTransport: "websocket" },
+      { reason: "retry_success", upstreamTransport: "http" },
+    ]);
   });
 
   test.each([400, 404, 429, 524])("preserves ProxyError status %i", async (status) => {

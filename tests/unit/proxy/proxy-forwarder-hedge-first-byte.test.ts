@@ -615,6 +615,9 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
       }
     ).createStreamingShadowSession(session, minimax);
 
+    session.upstreamTransport = "websocket";
+    shadow.upstreamTransport = "http";
+
     expect(shadow.request.model).toBe(fireworksRedirect);
     expect(ModelRedirector.apply(shadow, minimax)).toBe(true);
     expect(shadow.request.model).toBe(minimaxRedirect);
@@ -642,6 +645,9 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
     const hedgeWinner = session
       .getProviderChain()
       .find((item) => item.id === minimax.id && item.reason === "hedge_winner");
+
+    expect(session.upstreamTransport).toBe("http");
+    expect(hedgeWinner?.upstreamTransport).toBe("http");
 
     expect(hedgeWinner?.modelRedirect).toMatchObject({
       originalModel: requestedModel,

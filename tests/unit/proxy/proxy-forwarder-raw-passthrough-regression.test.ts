@@ -341,7 +341,228 @@ describe("ProxyForwarder raw passthrough regression", () => {
       })
     );
     expect(fetchWithoutAutoDecode).not.toHaveBeenCalled();
+    expect(session.upstreamTransport).toBe("websocket");
     expect(await response.text()).toBe(upstreamSse);
+  });
+
+  it.each([
+    "ws_module_unavailable",
+    "ws_upgrade_rejected",
+    "ws_payload_too_large",
+    "ws_closed_before_first_event",
+    "ws_error_pre_first_event",
+  ])(
+    "requests full-context recovery instead of HTTP after continuation failure %s",
+    async (reason) => {
+      const provider = createProvider();
+      const session = createRawPassthroughSession(
+        JSON.stringify({
+          model: "gpt-5.5",
+          store: false,
+          previous_response_id: "resp_previous",
+          input: [{ type: "function_call_output", call_id: "call_1", output: "ok" }],
+        })
+      );
+      mocks.evaluateResponsesWsEligibility.mockResolvedValue({
+        isWebsocketClient: true,
+        eligible: true,
+      });
+      mocks.tryResponsesWebsocketUpstream.mockResolvedValue({
+        failed: true,
+        reason,
+        cacheableAsUnsupported: true,
+      });
+      const fetchWithoutAutoDecode = vi
+        .spyOn(ProxyForwarder as any, "fetchWithoutAutoDecode")
+        .mockResolvedValue(new Response("unsafe-http", { status: 200 }));
+      const { doForward } = ProxyForwarder as unknown as {
+        doForward: (
+          session: ProxySession,
+          provider: Provider,
+          baseUrl: string
+        ) => Promise<Response>;
+      };
+
+      await expect(doForward(session, provider, provider.url)).rejects.toMatchObject({
+        name: "ResponsesWsContinuationError",
+        statusCode: 400,
+        reason,
+      });
+      expect(fetchWithoutAutoDecode).not.toHaveBeenCalled();
+      expect(isResponsesWsUnsupported(provider.id)).toEqual({ unsupported: false });
+    }
+  );
+
+  it("does not treat store=true on a WS request as proof of HTTP account compatibility", async () => {
+    const provider = createProvider();
+    const session = createRawPassthroughSession(
+      JSON.stringify({
+        model: "gpt-5.5",
+        store: true,
+        previous_response_id: "resp_previous",
+        input: "delta",
+      })
+    );
+    mocks.evaluateResponsesWsEligibility.mockResolvedValue({
+      isWebsocketClient: true,
+      eligible: false,
+      downgradeReason: "setting_disabled",
+    });
+    const fetchWithoutAutoDecode = vi.spyOn(ProxyForwarder as any, "fetchWithoutAutoDecode");
+    const { doForward } = ProxyForwarder as unknown as {
+      doForward: (session: ProxySession, provider: Provider, baseUrl: string) => Promise<Response>;
+    };
+    await expect(doForward(session, provider, provider.url)).rejects.toMatchObject({
+      name: "ResponsesWsContinuationError",
+    });
+    expect(fetchWithoutAutoDecode).not.toHaveBeenCalled();
+  });
+
+  it.each(["setting_disabled", "provider_not_codex", "endpoint_ws_unsupported_cached"])(
+    "does not send a WS continuation as HTTP when eligibility rejects it: %s",
+    async (downgradeReason) => {
+      const provider = createProvider();
+      const session = createRawPassthroughSession(
+        JSON.stringify({
+          model: "gpt-5.5",
+          previous_response_id: "resp_previous",
+          input: "incremental-only",
+        })
+      );
+      mocks.evaluateResponsesWsEligibility.mockResolvedValue({
+        isWebsocketClient: true,
+        eligible: false,
+        downgradeReason,
+      });
+      const fetchWithoutAutoDecode = vi
+        .spyOn(ProxyForwarder as any, "fetchWithoutAutoDecode")
+        .mockResolvedValue(new Response("unsafe-http", { status: 200 }));
+      const { doForward } = ProxyForwarder as unknown as {
+        doForward: (
+          session: ProxySession,
+          provider: Provider,
+          baseUrl: string
+        ) => Promise<Response>;
+      };
+
+      await expect(doForward(session, provider, provider.url)).rejects.toMatchObject({
+        name: "ResponsesWsContinuationError",
+        reason: downgradeReason,
+      });
+      expect(mocks.tryResponsesWebsocketUpstream).not.toHaveBeenCalled();
+      expect(fetchWithoutAutoDecode).not.toHaveBeenCalled();
+    }
+  );
+
+  it("does not swallow a thrown WS continuation error and retry it over HTTP", async () => {
+    const provider = createProvider();
+    provider.proxyUrl = "http://proxy.example.com:8080";
+    provider.proxyFallbackToDirect = true;
+    const session = createRawPassthroughSession(
+      JSON.stringify({ model: "gpt-5.5", previous_response_id: "resp_previous", input: "delta" })
+    );
+    mocks.evaluateResponsesWsEligibility.mockResolvedValue({
+      isWebsocketClient: true,
+      eligible: true,
+    });
+    mocks.tryResponsesWebsocketUpstream.mockRejectedValue(new Error("HTTP/2 proxy unavailable"));
+    const fetchWithoutAutoDecode = vi
+      .spyOn(ProxyForwarder as any, "fetchWithoutAutoDecode")
+      .mockResolvedValue(new Response("unsafe-http", { status: 200 }));
+    const { doForward } = ProxyForwarder as unknown as {
+      doForward: (session: ProxySession, provider: Provider, baseUrl: string) => Promise<Response>;
+    };
+
+    await expect(doForward(session, provider, provider.url)).rejects.toMatchObject({
+      name: "ResponsesWsContinuationError",
+      reason: "ws_attempt_threw",
+    });
+    expect(fetchWithoutAutoDecode).not.toHaveBeenCalled();
+  });
+
+  it("preserves client cancellation while a WS continuation is awaiting its first event", async () => {
+    const provider = createProvider();
+    const session = createRawPassthroughSession(
+      JSON.stringify({ model: "gpt-5.5", previous_response_id: "resp_previous", input: "delta" })
+    );
+    const controller = new AbortController();
+    session.clientAbortSignal = controller.signal;
+    mocks.evaluateResponsesWsEligibility.mockResolvedValue({
+      isWebsocketClient: true,
+      eligible: true,
+    });
+    const abort = new DOMException("Client cancelled the request", "AbortError");
+    mocks.tryResponsesWebsocketUpstream.mockImplementation(async () => {
+      controller.abort(abort);
+      return { failed: true, reason: "ws_error_pre_first_event", cacheableAsUnsupported: false };
+    });
+    const fetchWithoutAutoDecode = vi.spyOn(ProxyForwarder as any, "fetchWithoutAutoDecode");
+    const { doForward } = ProxyForwarder as unknown as {
+      doForward: (session: ProxySession, provider: Provider, baseUrl: string) => Promise<Response>;
+    };
+    await expect(doForward(session, provider, provider.url)).rejects.toMatchObject({
+      name: "ProxyError",
+      statusCode: 499,
+    });
+    expect(fetchWithoutAutoDecode).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, null, ""])(
+    "allows full requests to fall back with previous_response_id=%s",
+    async (previousResponseId) => {
+      const provider = createProvider();
+      const session = createRawPassthroughSession(
+        JSON.stringify({
+          model: "gpt-5.5",
+          previous_response_id: previousResponseId,
+          input: "full-context",
+        })
+      );
+      mocks.evaluateResponsesWsEligibility.mockResolvedValue({
+        isWebsocketClient: true,
+        eligible: false,
+      });
+      const fetchWithoutAutoDecode = vi
+        .spyOn(ProxyForwarder as any, "fetchWithoutAutoDecode")
+        .mockResolvedValue(new Response("http-ok", { status: 200 }));
+      const { doForward } = ProxyForwarder as unknown as {
+        doForward: (
+          session: ProxySession,
+          provider: Provider,
+          baseUrl: string
+        ) => Promise<Response>;
+      };
+
+      expect(await (await doForward(session, provider, provider.url)).text()).toBe("http-ok");
+      expect(session.upstreamTransport).toBe("http");
+      expect(fetchWithoutAutoDecode).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it("preserves HTTP previous_response_id requests from API-key clients", async () => {
+    const provider = createProvider();
+    const original = JSON.stringify({
+      model: "gpt-5.5",
+      previous_response_id: "stored-response",
+      input: "delta",
+    });
+    const session = createRawPassthroughSession(original);
+    mocks.evaluateResponsesWsEligibility.mockResolvedValue({
+      isWebsocketClient: false,
+      eligible: false,
+    });
+    const fetchWithoutAutoDecode = vi
+      .spyOn(ProxyForwarder as any, "fetchWithoutAutoDecode")
+      .mockImplementation(async (_url: string, init: RequestInit) => {
+        expect(readBodyText(init.body ?? undefined)).toBe(original);
+        return new Response("http-ok", { status: 200 });
+      });
+    const { doForward } = ProxyForwarder as unknown as {
+      doForward: (session: ProxySession, provider: Provider, baseUrl: string) => Promise<Response>;
+    };
+
+    expect(await (await doForward(session, provider, provider.url)).text()).toBe("http-ok");
+    expect(fetchWithoutAutoDecode).toHaveBeenCalledTimes(1);
   });
 
   it("retries a WS size rejection over HTTP without caching the endpoint as unsupported", async () => {

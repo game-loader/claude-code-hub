@@ -56,6 +56,13 @@
     }
   },
   "logs": {
+    "transport": {
+      "websocket": "WS",
+      "http": "HTTP",
+      "unknown": "不明",
+      "tooltip": "上流への通信方式: {transport}",
+      "unknownTooltip": "上流への通信方式は記録されていません"
+    },
     "title": "使用ログ",
     "description": "API 呼び出しレコードを表示および分析します",
     "filters": {

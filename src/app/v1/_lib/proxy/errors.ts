@@ -551,9 +551,15 @@ export class ProxyError extends Error {
   }
 }
 
-/**
- * 错误分类：区分供应商错误和系统错误
- */
+/** Connection-local continuation state must be recovered by the client, not provider failover. */
+export class ResponsesWsContinuationError extends ProxyError {
+  constructor(public readonly reason: string) {
+    super("previous_response_not_found", 400);
+    this.name = "ResponsesWsContinuationError";
+  }
+}
+
+/** 错误分类：区分供应商错误和系统错误。 */
 export enum ErrorCategory {
   PROVIDER_ERROR, // 供应商问题（所有 4xx/5xx HTTP 错误）→ 计入熔断器 + 直接切换
   SYSTEM_ERROR, // 系统/网络问题（fetch 网络异常）→ 不计入熔断器 + 先重试1次
@@ -1006,6 +1012,10 @@ export async function categorizeErrorAsync(error: Error): Promise<ErrorCategory>
   // 优先级 2: 客户端中断检测 - 使用统一的精确检测函数
   if (isClientAbortError(error)) {
     return ErrorCategory.CLIENT_ABORT; // 客户端主动中断
+  }
+
+  if (error instanceof ResponsesWsContinuationError) {
+    return ErrorCategory.NON_RETRYABLE_CLIENT_ERROR;
   }
 
   // 优先级 3: 本地 DB admission 过载。Drizzle 会把底层错误包在 cause 中，

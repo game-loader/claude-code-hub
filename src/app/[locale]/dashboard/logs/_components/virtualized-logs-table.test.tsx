@@ -99,8 +99,10 @@ vi.mock("@/components/ui/button", () => ({
 }));
 
 vi.mock("@/components/ui/badge", () => ({
-  Badge: ({ children, className }: React.ComponentProps<"span">) => (
-    <span className={className}>{children}</span>
+  Badge: ({ children, className, ...props }: React.ComponentProps<"span">) => (
+    <span className={className} {...props}>
+      {children}
+    </span>
   ),
 }));
 
@@ -215,6 +217,15 @@ function renderTableWithLog(overrides: Partial<UsageLogRow>) {
 
   return renderToStaticMarkup(<VirtualizedLogsTable filters={{}} autoRefreshEnabled={false} />);
 }
+
+test("shows the actual upstream transport beside each duration in the virtualized table", () => {
+  const html = renderTableWithLog({
+    providerChain: [
+      { id: 1, name: "p", reason: "request_success", statusCode: 200, upstreamTransport: "http" },
+    ],
+  });
+  expect(html).toContain('data-upstream-transport="http"');
+});
 
 test("shows the client session ID and canonical prefix identity in the virtualized tooltip", () => {
   renderTableWithLog({

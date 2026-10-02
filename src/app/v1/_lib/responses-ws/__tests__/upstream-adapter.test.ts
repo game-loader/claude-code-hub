@@ -640,6 +640,7 @@ describe("tryResponsesWebsocketUpstream", () => {
 
     // Turn 1: full input, store=false, no previous_response_id yet.
     const turn1 = await tryResponsesWebsocketUpstream({
+      sessionId: "client-ws-session-field-preservation",
       provider: codexProvider(),
       upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
       upstreamHeaders: new Headers({ authorization: "Bearer sk-mock" }),
@@ -658,6 +659,7 @@ describe("tryResponsesWebsocketUpstream", () => {
     // preserved. The adapter must forward both fields untouched so the
     // upstream can re-use its in-connection state.
     const turn2 = await tryResponsesWebsocketUpstream({
+      sessionId: "client-ws-session-field-preservation",
       provider: codexProvider(),
       upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
       upstreamHeaders: new Headers({ authorization: "Bearer sk-mock" }),
@@ -749,6 +751,108 @@ describe("tryResponsesWebsocketUpstream", () => {
     expect(receivedFrames[0]?.generate).toBeUndefined();
     expect(receivedFrames[1]?.previous_response_id).toBe("resp_1");
   });
+
+  it.each([
+    "missing-session",
+    "retention-disabled",
+    "provider-change",
+    "headers-change",
+    "upstream-close",
+  ])("does not send an unstored continuation on a new connection after %s", async (reason) => {
+    let connections = 0;
+    const frames: Array<Record<string, unknown>> = [];
+    server = await startMockServer((socket) => {
+      connections += 1;
+      socket.on("message", (data) => {
+        frames.push(JSON.parse(data.toString()));
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_first" } }));
+      });
+    });
+    const common = {
+      provider: codexProvider(),
+      upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+      upstreamHeaders: new Headers({ authorization: "Bearer sk-mock" }),
+      sessionId: "client-ws-session-recovery",
+    };
+    if (reason === "retention-disabled") setResponsesWsSessionMaxEntriesForTests(0);
+    if (reason !== "missing-session") {
+      const first = await tryResponsesWebsocketUpstream({
+        ...common,
+        body: { model: "gpt-5.5", store: false, input: "first" },
+      });
+      expect("response" in first).toBe(true);
+      if (!("response" in first)) return;
+      await collectSseBody(first.response);
+    }
+    if (reason === "provider-change") common.provider = { ...common.provider, id: 2 };
+    if (reason === "headers-change") {
+      common.upstreamHeaders = new Headers({ authorization: "Bearer new-account" });
+    }
+    if (reason === "upstream-close") {
+      const socket = [...server.wss.clients][0]!;
+      const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+      socket.close(1000);
+      await closed;
+      await vi.waitFor(() => expect(getResponsesWsSessionCountForTests()).toBe(0));
+    }
+    const priorConnections = connections;
+    const priorFrames = frames.length;
+    const onUpstreamDispatch = vi.fn();
+
+    const continuation = await tryResponsesWebsocketUpstream({
+      ...common,
+      onUpstreamDispatch,
+      body: { model: "gpt-5.5", store: false, previous_response_id: "resp_first", input: "delta" },
+    });
+    expect(continuation).toEqual({
+      failed: true,
+      reason: "ws_continuation_unavailable",
+      cacheableAsUnsupported: false,
+    });
+    expect(connections).toBe(priorConnections);
+    expect(frames).toHaveLength(priorFrames);
+    expect(onUpstreamDispatch).not.toHaveBeenCalled();
+
+    // A client can safely retry using a full request without the stale ID.
+    const recovered = await tryResponsesWebsocketUpstream({
+      ...common,
+      onUpstreamDispatch,
+      body: { model: "gpt-5.5", store: false, input: "full-context" },
+    });
+    expect("response" in recovered).toBe(true);
+    if (!("response" in recovered)) return;
+    expect(await collectSseBody(recovered.response)).toContain("response.completed");
+    expect(frames.at(-1)).toMatchObject({ input: "full-context" });
+    expect(frames.at(-1)?.previous_response_id).toBeUndefined();
+    expect(onUpstreamDispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([true, undefined])(
+    "allows stored continuations to be retrieved on a fresh upstream WS (store=%s)",
+    async (store) => {
+      const frames: Array<Record<string, unknown>> = [];
+      server = await startMockServer((socket) => {
+        socket.on("message", (raw) => {
+          frames.push(JSON.parse(raw.toString()));
+          socket.send(
+            JSON.stringify({ type: "response.completed", response: { id: "resp_stored" } })
+          );
+        });
+      });
+      const result = await tryResponsesWebsocketUpstream({
+        provider: codexProvider(),
+        upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+        upstreamHeaders: new Headers({ authorization: "Bearer sk-mock" }),
+        sessionId: "new-client-session",
+        body: { model: "gpt-5.5", store, previous_response_id: "resp_stored", input: "delta" },
+      });
+      expect("response" in result).toBe(true);
+      if (!("response" in result)) return;
+      await collectSseBody(result.response);
+      expect(frames[0]?.previous_response_id).toBe("resp_stored");
+      expect(frames[0]?.store).toBe(store);
+    }
+  );
 
   it("keeps generate=false warmup on the same upstream WS for the generated turn", async () => {
     const receivedFrames: Array<Record<string, unknown>> = [];

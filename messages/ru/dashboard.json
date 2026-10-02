@@ -56,6 +56,13 @@
     }
   },
   "logs": {
+    "transport": {
+      "websocket": "WS",
+      "http": "HTTP",
+      "unknown": "Неизвестно",
+      "tooltip": "Транспорт к вышестоящему серверу: {transport}",
+      "unknownTooltip": "Транспорт к вышестоящему серверу не записан"
+    },
     "title": "Журналы использования",
     "description": "Просмотр и анализ записей вызовов API",
     "filters": {

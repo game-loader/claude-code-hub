@@ -42,6 +42,7 @@ import type { SessionIdentityMetadata } from "@/types/session";
 import type { SpecialSetting } from "@/types/special-settings";
 import type { BillingModelSource, CodexPriorityBillingSource } from "@/types/system-config";
 import type { User } from "@/types/user";
+import type { ResponsesWsContinuationRoute } from "../responses-ws/upstream-adapter";
 import type { AffinityLookupResult } from "./affinity/affinity-store";
 import type { FingerprintChain } from "./affinity/fingerprint";
 import { type EndpointPolicy, resolveEndpointPolicy } from "./endpoint-policy";
@@ -188,6 +189,8 @@ export class ProxySession {
   upstreamSessionSeed: string | null = null;
   /** Attempt-local transport; copied from the winning session after a race. */
   upstreamTransport: "http" | "websocket" | null = null;
+  responsesWsContinuationRoute: ResponsesWsContinuationRoute | null = null;
+  responsesWsContinuationErrorReason: string | null = null;
   // 客户端或补全器已建立连续身份时，单条增量请求也应参与供应商复用。
   // 内容哈希/随机降级身份仍依赖上下文长度，避免相同短提示串到同一供应商会话。
   private allowSingleTurnProviderReuse = false;

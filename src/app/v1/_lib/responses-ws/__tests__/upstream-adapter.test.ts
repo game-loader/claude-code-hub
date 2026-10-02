@@ -7,6 +7,7 @@ import {
   clearResponsesWsSessionsForTests,
   cleanupResponsesWsSession,
   getResponsesWsSessionCountForTests,
+  getResponsesWsContinuationRoute,
   setResponsesWsSessionMaxEntriesForTests,
   tryResponsesWebsocketUpstream,
 } from "../upstream-adapter";
@@ -157,11 +158,229 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
 describe("tryResponsesWebsocketUpstream", () => {
   let server: ServerHandle | null = null;
 
+  it("expires all route entries after idle timeout and ignores cleanup for other clients", async () => {
+    server = await startMockServer((socket) => {
+      socket.on("message", () =>
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_idle" } }))
+      );
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      for (const id of [1, 2]) {
+        const result = await tryResponsesWebsocketUpstream({
+          provider: { ...codexProvider(), id },
+          upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+          upstreamHeaders: new Headers(),
+          sessionId: "idle-client",
+          body: { input: "full" },
+        });
+        if (!("response" in result)) throw new Error("expected WS response");
+        await collectSseBody(result.response);
+      }
+      cleanupResponsesWsSession("unrelated-client");
+      expect(getResponsesWsSessionCountForTests()).toBe(2);
+      await vi.advanceTimersByTimeAsync(65 * 60 * 1000);
+      expect(getResponsesWsSessionCountForTests()).toBe(0);
+      expect(getResponsesWsContinuationRoute("idle-client", "resp_idle")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps ownership across turn header changes without changing the authenticated socket", async () => {
+    let connections = 0;
+    let fail = false;
+    server = await startMockServer((socket) => {
+      connections++;
+      socket.on("message", () => {
+        socket.send(
+          JSON.stringify(
+            fail
+              ? { type: "response.failed", response: { id: "resp_failed" } }
+              : { type: "response.completed", response: { id: "resp_owned" } }
+          )
+        );
+      });
+    });
+    const common = {
+      provider: codexProvider(),
+      upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+      sessionId: "turn-headers",
+    };
+    expect(getResponsesWsContinuationRoute(null, "resp_owned")).toBeNull();
+    const first = await tryResponsesWebsocketUpstream({
+      ...common,
+      upstreamHeaders: new Headers({
+        authorization: "Bearer test",
+        "x-codex-turn-state": "turn-1",
+        "x-client-request-id": "request-1",
+      }),
+      body: { store: false, input: "first" },
+    });
+    if (!("response" in first)) throw new Error("expected WS response");
+    await collectSseBody(first.response);
+    expect(getResponsesWsContinuationRoute("turn-headers", "resp_owned")).not.toBeNull();
+    fail = true;
+    const next = await tryResponsesWebsocketUpstream({
+      ...common,
+      upstreamHeaders: new Headers({
+        authorization: "Bearer test",
+        "x-codex-turn-state": "turn-2",
+        "x-client-request-id": "request-2",
+      }),
+      body: { store: false, previous_response_id: "resp_owned", input: "delta" },
+    });
+    expect("response" in next && next.reused).toBe(true);
+    if ("response" in next) await collectSseBody(next.response);
+    expect(connections).toBe(1);
+    expect(getResponsesWsContinuationRoute("turn-headers", "resp_owned")).toBeNull();
+    expect(getResponsesWsContinuationRoute("turn-headers", "resp_failed")).toBeNull();
+  });
+
+  it("retains both hedge sockets and routes each continuation to its completed response owner", async () => {
+    let connections = 0;
+    server = await startMockServer((socket) => {
+      const connection = ++connections;
+      socket.on("message", () => {
+        socket.send(
+          JSON.stringify({ type: "response.completed", response: { id: `resp_${connection}` } })
+        );
+      });
+    });
+    const common = {
+      upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+      upstreamHeaders: new Headers({ authorization: "Bearer sk-mock" }),
+      sessionId: "hedged-client",
+      body: { model: "gpt-5.5", store: false, input: "first" },
+    };
+    const first = await tryResponsesWebsocketUpstream({
+      ...common,
+      provider: codexProvider(),
+      endpointId: 11,
+    });
+    const winner = await tryResponsesWebsocketUpstream({
+      ...common,
+      provider: { ...codexProvider(), id: 2 },
+      endpointId: 22,
+    });
+    if (!("response" in first) || !("response" in winner))
+      throw new Error("expected two WS responses");
+    await collectSseBody(winner.response);
+    await first.response.body?.cancel();
+    expect(getResponsesWsContinuationRoute("hedged-client", "resp_2")).toMatchObject({
+      providerId: 2,
+      endpointId: 22,
+    });
+    expect(getResponsesWsContinuationRoute("other-client", "resp_2")).toBeNull();
+    expect(getResponsesWsContinuationRoute("hedged-client", "resp_unknown")).toBeNull();
+    const next = await tryResponsesWebsocketUpstream({
+      ...common,
+      provider: { ...codexProvider(), id: 2 },
+      endpointId: 22,
+      body: { model: "gpt-5.5", store: false, previous_response_id: "resp_2", input: "delta" },
+    });
+    expect("response" in next).toBe(true);
+    if ("response" in next) await collectSseBody(next.response);
+    expect(connections).toBe(2);
+    cleanupResponsesWsSession("hedged-client");
+    expect(getResponsesWsContinuationRoute("hedged-client", "resp_2")).toBeNull();
+  });
+
+  it("gives continuations a 90 second first-event budget", async () => {
+    server = await startMockServer((socket) => {
+      socket.on("message", () => {
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_slow" } }));
+      });
+    });
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    try {
+      const common = {
+        provider: codexProvider(),
+        upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+        upstreamHeaders: new Headers(),
+        sessionId: "slow-client",
+      };
+      const first = await tryResponsesWebsocketUpstream({
+        ...common,
+        body: { store: false, input: "first" },
+      });
+      if (!("response" in first)) throw new Error("expected WS response");
+      await collectSseBody(first.response);
+      timeoutSpy.mockClear();
+      const next = await tryResponsesWebsocketUpstream({
+        ...common,
+        body: { store: false, previous_response_id: "resp_slow", input: "delta" },
+      });
+      if (!("response" in next)) throw new Error("expected WS continuation");
+      await collectSseBody(next.response);
+      expect(timeoutSpy.mock.calls.some(([, delay]) => delay === 90_000)).toBe(true);
+      expect(timeoutSpy.mock.calls.some(([, delay]) => delay === 20_000)).toBe(false);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
   afterEach(async () => {
     clearResponsesWsSessionsForTests();
     if (server) {
       await server.close();
       server = null;
+    }
+  });
+
+  it("keeps a slow retained continuation alive after 21 seconds", async () => {
+    let completeNext: (() => void) | undefined;
+    let notifyNext!: () => void;
+    const nextReceived = new Promise<void>((resolve) => {
+      notifyNext = resolve;
+    });
+    let frames = 0;
+    server = await startMockServer((socket) => {
+      socket.on("message", () => {
+        const complete = () =>
+          socket.send(
+            JSON.stringify({ type: "response.completed", response: { id: "resp_slow" } })
+          );
+        if (++frames === 1) complete();
+        else {
+          completeNext = complete;
+          notifyNext();
+        }
+      });
+    });
+    const common = {
+      provider: codexProvider(),
+      upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+      upstreamHeaders: new Headers(),
+      sessionId: "slow-retained",
+    };
+    const first = await tryResponsesWebsocketUpstream({
+      ...common,
+      body: { store: false, input: "first" },
+    });
+    if (!("response" in first)) throw new Error("expected WS response");
+    await collectSseBody(first.response);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let settled = false;
+      const nextPromise = tryResponsesWebsocketUpstream({
+        ...common,
+        body: { store: false, previous_response_id: "resp_slow", input: "delta" },
+      });
+      void nextPromise.then(() => {
+        settled = true;
+      });
+      await nextReceived;
+      expect(getResponsesWsContinuationRoute("slow-retained", "resp_slow")).toBeNull();
+      await vi.advanceTimersByTimeAsync(21_000);
+      expect(settled).toBe(false);
+      completeNext!();
+      const next = await nextPromise;
+      if (!("response" in next)) throw new Error("expected slow continuation response");
+      expect(await collectSseBody(next.response)).toContain("response.completed");
+      clearResponsesWsSessionsForTests();
+    } finally {
+      vi.useRealTimers();
     }
   });
 
@@ -1022,13 +1241,17 @@ describe("tryResponsesWebsocketUpstream", () => {
       __cchCleanupResponsesWsSession?: (sessionId: string) => void;
       __cchResponsesWsPersistentState?: { sessions: Map<string, unknown> };
     };
-    expect(globalState.__cchResponsesWsPersistentState?.sessions.has(sessionId)).toBe(true);
+    expect(
+      [...globalState.__cchResponsesWsPersistentState!.sessions.values()].some(
+        (entry) => (entry as { sessionId: string }).sessionId === sessionId
+      )
+    ).toBe(true);
 
     globalState.__cchCleanupResponsesWsSession?.(sessionId);
     await closed;
 
     expect(upstreamCloseCode).toBe(1000);
-    expect(globalState.__cchResponsesWsPersistentState?.sessions.has(sessionId)).toBe(false);
+    expect(getResponsesWsSessionCountForTests()).toBe(0);
   });
 
   it("does not close an active retained session when a concurrent same-session request opens a fresh upstream WS", async () => {
@@ -1298,7 +1521,7 @@ describe("tryResponsesWebsocketUpstream", () => {
       expect(result.message).toContain("aborted before first upstream WebSocket event");
       expect(terminateSpy).toHaveBeenCalledTimes(1);
       expect(closeSpy).not.toHaveBeenCalled();
-      expect(timeoutSpy.mock.calls.some(([, delay]) => delay === 20_000)).toBe(false);
+      expect(timeoutSpy.mock.calls.some(([, delay]) => delay === 90_000)).toBe(false);
       expect(processErrors.uncaughtExceptions).toEqual([]);
       expect(processErrors.unhandledRejections).toEqual([]);
 
@@ -1391,7 +1614,7 @@ describe("tryResponsesWebsocketUpstream", () => {
       delay?: number,
       ...args: unknown[]
     ) => {
-      if (delay === 20_000) {
+      if (delay === 90_000) {
         firstEventTimeoutCallback = () => callback(...args);
         return placeholderTimer;
       }

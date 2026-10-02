@@ -8,8 +8,8 @@
  * response exactly like an HTTP Responses SSE stream.
  *
  * When the request came from one client WebSocket connection, server.js passes
- * a per-client `x-cch-responses-ws-session` marker. We reuse one upstream
- * WebSocket for that marker so Codex's `store=false` + `previous_response_id`
+ * a per-client `x-cch-responses-ws-session` marker. We retain upstream
+ * WebSockets by session and route so Codex's `store=false` + `previous_response_id`
  * continuation can hit the upstream connection-local cache, matching OpenAI's
  * WebSocket mode semantics.
  */
@@ -21,6 +21,7 @@ import type { Provider } from "@/types/provider";
 import { hasResponsesWsContinuation } from "./continuation";
 import { RESERVED_INTERNAL_HEADERS } from "./internal-secret";
 import { getUpstreamPayloadTooLargeMessage } from "./payload-too-large";
+import { getResponsesWsFirstEventTimeoutMs } from "./timeout-policy";
 
 declare global {
   // server.js is CommonJS and cannot import this TS module directly. The
@@ -73,7 +74,6 @@ const HANDSHAKE_TIMEOUT_MS = 10_000;
 // succeeds, an upstream may still hang without sending any event (bug, dead
 // connection, half-open socket). Without a separate first-event timer the
 // `await openPromise` below would hang forever and tie up the request slot.
-const FIRST_EVENT_TIMEOUT_MS = 20_000;
 
 // Hard limit on one upstream message and on queued bytes between the upstream
 // WebSocket and downstream SSE consumer. A message already handed to a waiting
@@ -162,8 +162,17 @@ const FORBIDDEN_UPSTREAM_WS_HEADERS = new Set([
   ...RESERVED_INTERNAL_HEADERS,
 ]);
 
+export type ResponsesWsContinuationRoute = {
+  providerId: number;
+  endpointId: number | null;
+  baseUrl: string;
+};
+
 type PersistentWsEntry = {
+  key: string;
   sessionId: string;
+  route: ResponsesWsContinuationRoute;
+  responseId: string | null;
   fingerprint: string;
   ws: WebSocketType;
   active: boolean;
@@ -232,6 +241,8 @@ function buildConnectionFingerprint(options: {
   headers: Record<string, string>;
 }): string {
   const normalizedHeaders = Object.entries(options.headers)
+    // Turn metadata can change while continuing on the already authenticated socket.
+    .filter(([key]) => !["x-codex-turn-state", "x-client-request-id"].includes(key.toLowerCase()))
     .map(([key, value]) => [key.toLowerCase(), value] as const)
     .sort(([a], [b]) => a.localeCompare(b));
 
@@ -310,26 +321,26 @@ function safelyCloseWebSocket(ws: WebSocketType, code: number): void {
   }
 }
 
-function forgetPersistentSession(sessionId: string, ws?: WebSocketType): void {
-  const entry = persistentSessions.get(sessionId);
+function forgetPersistentSession(key: string, ws?: WebSocketType): void {
+  const entry = persistentSessions.get(key);
   if (!entry) return;
   if (ws && entry.ws !== ws) return;
   if (entry.idleTimer) {
     clearTimeout(entry.idleTimer);
     entry.idleTimer = null;
   }
-  persistentSessions.delete(sessionId);
+  persistentSessions.delete(key);
 }
 
 function closePersistentEntry(entry: PersistentWsEntry, code: number): void {
-  forgetPersistentSession(entry.sessionId, entry.ws);
+  forgetPersistentSession(entry.key, entry.ws);
   safelyCloseWebSocket(entry.ws, code);
 }
 
 function armPersistentIdleTimer(entry: PersistentWsEntry): void {
   if (entry.idleTimer) clearTimeout(entry.idleTimer);
   entry.idleTimer = setTimeout(() => {
-    const current = persistentSessions.get(entry.sessionId);
+    const current = persistentSessions.get(entry.key);
     if (current !== entry || current.active) return;
     logger.info("[ResponsesWsAdapter] closing idle upstream WS session", {
       sessionId: entry.sessionId,
@@ -359,9 +370,11 @@ function prunePersistentSessions(): void {
 }
 
 function registerPersistentSession(
+  key: string,
   sessionId: string,
   fingerprint: string,
-  ws: WebSocketType
+  ws: WebSocketType,
+  route: ResponsesWsContinuationRoute
 ): PersistentWsEntry | null {
   prunePersistentSessions();
   if (persistentSessions.size >= persistentState.maxEntries) {
@@ -373,7 +386,10 @@ function registerPersistentSession(
   }
 
   const entry: PersistentWsEntry = {
+    key,
     sessionId,
+    route,
+    responseId: null,
     fingerprint,
     ws,
     active: true,
@@ -383,21 +399,39 @@ function registerPersistentSession(
   };
 
   ws.on("close", () => {
-    forgetPersistentSession(sessionId, ws);
+    forgetPersistentSession(key, ws);
   });
   ws.on("error", () => {
-    forgetPersistentSession(sessionId, ws);
+    forgetPersistentSession(key, ws);
   });
 
-  persistentSessions.set(sessionId, entry);
+  persistentSessions.set(key, entry);
   return entry;
 }
 
 export function cleanupResponsesWsSession(sessionId: string): void {
-  const entry = persistentSessions.get(sessionId);
-  if (!entry) return;
-  logger.info("[ResponsesWsAdapter] cleaning upstream WS session", { sessionId });
-  closePersistentEntry(entry, 1000);
+  for (const entry of persistentSessions.values()) {
+    if (entry.sessionId === sessionId) closePersistentEntry(entry, 1000);
+  }
+}
+
+/** Only a completed response on a live, idle socket establishes continuation ownership. */
+export function getResponsesWsContinuationRoute(
+  sessionId: string | null,
+  responseId: string
+): ResponsesWsContinuationRoute | null {
+  if (!sessionId) return null;
+  for (const entry of persistentSessions.values()) {
+    if (
+      entry.sessionId === sessionId &&
+      entry.responseId === responseId &&
+      !entry.active &&
+      isWsOpen(entry.ws)
+    ) {
+      return { ...entry.route };
+    }
+  }
+  return null;
 }
 
 export function clearResponsesWsSessionsForTests(): void {
@@ -426,6 +460,7 @@ export async function tryResponsesWebsocketUpstream(options: {
   body: Record<string, unknown>;
   sessionId?: string | null;
   endpointId?: number | null;
+  endpointUrl?: string;
   abortSignal?: AbortSignal;
   onUpstreamDispatch?: () => void;
 }): Promise<UpstreamWsResult> {
@@ -446,6 +481,15 @@ export async function tryResponsesWebsocketUpstream(options: {
     upstreamUrl: wssUrl,
     headers,
   });
+  const persistentKey = sessionId ? `${sessionId}:${fingerprint}` : null;
+  const route = {
+    providerId: options.provider.id,
+    endpointId: options.endpointId ?? null,
+    baseUrl: options.endpointUrl ?? options.upstreamUrl,
+  };
+  const firstEventTimeoutMs = getResponsesWsFirstEventTimeoutMs(
+    options.provider.firstByteTimeoutStreamingMs ?? 0
+  );
 
   // 握手期间只保留发送所需字符串；send() 接管后立即断开本地引用。后续流事件
   // 监听器不得闭包捕获完整 options，否则整份请求 body 会滞留到生成结束。
@@ -457,7 +501,7 @@ export async function tryResponsesWebsocketUpstream(options: {
   let ws: WebSocketType;
 
   if (sessionId) {
-    const existing = persistentSessions.get(sessionId) ?? null;
+    const existing = persistentSessions.get(persistentKey!) ?? null;
     if (existing) {
       if (existing.active && !isWsClosingOrClosed(existing.ws)) {
         logger.warn(
@@ -543,7 +587,7 @@ export async function tryResponsesWebsocketUpstream(options: {
   };
 
   const closeAndForget = (code: number) => {
-    if (sessionId) forgetPersistentSession(sessionId, ws);
+    if (persistentKey) forgetPersistentSession(persistentKey, ws);
     safelyCloseWebSocket(ws, code);
   };
 
@@ -747,7 +791,7 @@ export async function tryResponsesWebsocketUpstream(options: {
       };
     }
     socketClosed = true;
-    if (sessionId) forgetPersistentSession(sessionId, ws);
+    if (persistentKey) forgetPersistentSession(persistentKey, ws);
     if (queueResolver) {
       const resolve = queueResolver;
       queueResolver = null;
@@ -757,7 +801,7 @@ export async function tryResponsesWebsocketUpstream(options: {
 
   const onClose = (code: number, reason: Buffer | string) => {
     socketClosed = true;
-    if (sessionId) forgetPersistentSession(sessionId, ws);
+    if (persistentKey) forgetPersistentSession(persistentKey, ws);
     if (!firstEventSeen) {
       finishOpen({
         ok: false,
@@ -823,7 +867,7 @@ export async function tryResponsesWebsocketUpstream(options: {
       persistentEntry.active = false;
       persistentEntry.lastUsedAt = Date.now();
       const retainedForReuse = sessionId
-        ? persistentSessions.get(sessionId) === persistentEntry
+        ? persistentSessions.get(persistentKey!) === persistentEntry
         : false;
       if (!retainedForReuse) {
         closeDetachedEntry = !options?.closeCode;
@@ -832,7 +876,7 @@ export async function tryResponsesWebsocketUpstream(options: {
       }
     }
     if (options?.forgetSession && sessionId) {
-      forgetPersistentSession(sessionId, ws);
+      forgetPersistentSession(persistentKey!, ws);
     }
     if (options?.closeCode) {
       closeAndForget(options.closeCode);
@@ -886,7 +930,7 @@ export async function tryResponsesWebsocketUpstream(options: {
         cacheableAsUnsupported: false,
       });
       finishRequest({ closeCode: 1011, forgetSession: true });
-    }, FIRST_EVENT_TIMEOUT_MS);
+    }, firstEventTimeoutMs);
   }
 
   if (reused) {
@@ -909,7 +953,7 @@ export async function tryResponsesWebsocketUpstream(options: {
   }
 
   if (sessionId && canRetainFreshSession && !persistentEntry && !socketClosed) {
-    persistentEntry = registerPersistentSession(sessionId, fingerprint, ws);
+    persistentEntry = registerPersistentSession(persistentKey!, sessionId, fingerprint, ws, route);
   }
 
   // Upstream WS is open and at least one event was received. Each downstream
@@ -968,6 +1012,16 @@ export async function tryResponsesWebsocketUpstream(options: {
     try {
       const parsed = JSON.parse(text);
       if (parsed && typeof parsed.type === "string" && TERMINAL_EVENT_TYPES.has(parsed.type)) {
+        if (persistentEntry && parsed.type !== "response.completed") {
+          persistentEntry.responseId = null;
+        }
+        if (
+          persistentEntry &&
+          parsed.type === "response.completed" &&
+          typeof parsed.response?.id === "string"
+        ) {
+          persistentEntry.responseId = parsed.response.id;
+        }
         terminal = true;
         terminalEventSeen = true;
         terminalEventShouldClosePersistent =

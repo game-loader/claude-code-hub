@@ -78,6 +78,7 @@ import {
   resolveAnthropicAuthHeaders,
 } from "../headers";
 import { hasResponsesWsContinuation } from "../responses-ws/continuation";
+import { isResponsesWsContinuationRequest } from "../responses-ws/continuation-routing";
 import {
   evaluateResponsesWsEligibility,
   getResponsesWsSessionId,
@@ -85,6 +86,7 @@ import {
 } from "../responses-ws/eligibility";
 import { RESERVED_INTERNAL_HEADERS } from "../responses-ws/internal-secret";
 import { shouldReconnectResponsesWs } from "../responses-ws/reconnect-policy";
+import { getResponsesWsFirstEventTimeoutMs } from "../responses-ws/timeout-policy";
 import { markResponsesWsUnsupported } from "../responses-ws/unsupported-cache";
 import { tryResponsesWebsocketUpstream } from "../responses-ws/upstream-adapter";
 import { buildProxyUrl } from "../url";
@@ -1691,6 +1693,18 @@ export class ProxyForwarder {
     }
 
     const requestStartedAt = Date.now();
+    if (session.responsesWsContinuationErrorReason) {
+      throw new ResponsesWsContinuationError(session.responsesWsContinuationErrorReason);
+    }
+    const wsContinuation = isResponsesWsContinuationRequest(
+      session.headers,
+      session.request.message
+    );
+    if (wsContinuation) session.disableStreamingHedge();
+    const continuationRoute = session.responsesWsContinuationRoute;
+    if (continuationRoute && continuationRoute.providerId !== session.provider.id) {
+      throw new ResponsesWsContinuationError("ws_continuation_provider_changed");
+    }
     const discoverySettings = await getCachedSystemSettings();
     const configuredSessionTtlSeconds = getEnvConfig().SESSION_TTL;
     const sessionTtlSeconds = Number.isFinite(configuredSessionTtlSeconds)
@@ -1782,7 +1796,7 @@ export class ProxyForwarder {
     const rawCrossProviderFallbackEnabled = session.isRawCrossProviderFallbackEnabled();
     const endpointPolicy = ProxyForwarder.getEndpointPolicy(session);
     const shouldSkipRawRetryAndProviderSwitch =
-      !endpointPolicy.allowRetry && !rawCrossProviderFallbackEnabled;
+      wsContinuation || (!endpointPolicy.allowRetry && !rawCrossProviderFallbackEnabled);
 
     let lastError: Error | null = null;
     let currentProvider = session.provider;
@@ -1798,7 +1812,7 @@ export class ProxyForwarder {
         currentProvider,
         envDefaultMaxAttempts
       );
-      if (rawCrossProviderFallbackEnabled) {
+      if (rawCrossProviderFallbackEnabled || wsContinuation) {
         maxAttemptsPerProvider = 1;
       }
       const reactiveRectifierRetryState: ReactiveRectifierRetryState = {
@@ -1827,7 +1841,12 @@ export class ProxyForwarder {
         baseUrl: string;
       }> = [];
 
-      if (isMcpRequest) {
+      if (continuationRoute) {
+        endpointCandidates.push({
+          endpointId: continuationRoute.endpointId,
+          baseUrl: continuationRoute.baseUrl,
+        });
+      } else if (isMcpRequest) {
         endpointCandidates.push({
           endpointId: null,
           baseUrl: currentProvider.url,
@@ -3231,6 +3250,9 @@ export class ProxyForwarder {
       } // ========== 内层循环结束 ==========
 
       // ========== 供应商切换逻辑 ==========
+      if (wsContinuation) {
+        throw lastError ?? new ResponsesWsContinuationError("ws_continuation_unavailable");
+      }
       const alternativeProvider = await ProxyForwarder.selectAlternative(
         session,
         failedProviderIds
@@ -3951,6 +3973,9 @@ export class ProxyForwarder {
       // 流式请求：使用首字节超时（快速失败）
       responseTimeoutMs =
         provider.firstByteTimeoutStreamingMs > 0 ? provider.firstByteTimeoutStreamingMs : 0;
+      if (isResponsesWsContinuationRequest(session.headers, session.request.message)) {
+        responseTimeoutMs = getResponsesWsFirstEventTimeoutMs(responseTimeoutMs);
+      }
       responseTimeoutType = "streaming_first_byte";
     } else {
       // 非流式请求：使用总超时（防止无限挂起）
@@ -4180,6 +4205,7 @@ export class ProxyForwarder {
               body: requestBodyJson,
               sessionId: getResponsesWsSessionId(session.headers),
               endpointId: responsesWsEndpointId,
+              endpointUrl: baseUrl || provider.url,
               abortSignal: transportController.signal,
               onUpstreamDispatch,
             };
@@ -4888,6 +4914,7 @@ export class ProxyForwarder {
 
   private static shouldUseStreamingHedge(session: ProxySession): boolean {
     const endpointPolicy = ProxyForwarder.getEndpointPolicy(session);
+    if (isResponsesWsContinuationRequest(session.headers, session.request.message)) return false;
     if (session.isStreamingHedgeDisabled()) {
       return false;
     }

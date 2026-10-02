@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import type { Provider } from "@/types/provider";
+import { ensureInternalSecret } from "@/app/v1/_lib/responses-ws/internal-secret";
+import type { ResponsesWsContinuationRoute } from "@/app/v1/_lib/responses-ws/upstream-adapter";
 
 /**
  * F3a nomination priority inside ProxyProviderResolver.ensure():
@@ -7,6 +9,13 @@ import type { Provider } from "@/types/provider";
  * with it on (product default) fingerprintable requests skip the session binding read entirely.
  * An affinity hint must still pass the full hard validation either way.
  */
+
+const wsMocks = vi.hoisted(() => ({
+  route: vi.fn(() => null as ResponsesWsContinuationRoute | null),
+}));
+vi.mock("@/app/v1/_lib/responses-ws/upstream-adapter", () => ({
+  getResponsesWsContinuationRoute: wsMocks.route,
+}));
 
 const envControl = vi.hoisted(() => ({ affinityEnabled: true }));
 
@@ -349,5 +358,107 @@ describe("ensure() nomination priority", () => {
     expect(storeMocks.lookup).not.toHaveBeenCalled();
     expect(session.affinity).toBeNull();
     expect(session.provider?.id).toBe(55);
+  });
+});
+
+describe("Responses WS continuation routing", () => {
+  function continuationSession() {
+    const headers = new Headers({
+      "x-cch-client-transport": "websocket",
+      "x-cch-responses-ws-forward": "1",
+      "x-cch-internal-secret": ensureInternalSecret(),
+      "x-cch-responses-ws-session": "client-ws",
+    });
+    return makeSession({
+      headers,
+      originalFormat: "response",
+      sessionId: "public-session",
+      request: {
+        message: {
+          model: "gpt-5.5",
+          store: false,
+          previous_response_id: "resp_winner",
+          input: "delta",
+        },
+      },
+      getOriginalModel: () => "gpt-5.5",
+      disableStreamingHedge: vi.fn(),
+    });
+  }
+  beforeEach(() => {
+    wsMocks.route.mockReset();
+  });
+
+  test("keeps the live q647 socket even when q727 has higher priority and session affinity is ignored", async () => {
+    const route = { providerId: 647, endpointId: 22, baseUrl: "https://winner.example/v1" };
+    wsMocks.route.mockReturnValue(route);
+    providerRepositoryMocks.findProviderById.mockResolvedValue(
+      makeProvider(647, { providerType: "codex", priority: 1, disableSessionReuse: true })
+    );
+    const session = continuationSession();
+    expect(await ProxyProviderResolver.ensure(session)).toBeNull();
+    expect(session.provider.id).toBe(647);
+    expect(session.responsesWsContinuationRoute).toEqual(route);
+    expect(session.disableStreamingHedge).toHaveBeenCalled();
+    expect(sessionManagerMocks.SessionManager.getSessionProvider).not.toHaveBeenCalled();
+    expect(session.getProvidersSnapshot).not.toHaveBeenCalled();
+    expect(wsMocks.route).toHaveBeenCalledWith("client-ws", "resp_winner");
+  });
+
+  test("requests context recovery when the completed response has no live socket", async () => {
+    wsMocks.route.mockReturnValue(null);
+    const session = continuationSession();
+    session.getProvidersSnapshot.mockResolvedValue([makeProvider(727, { providerType: "codex" })]);
+    expect(await ProxyProviderResolver.ensure(session)).toBeNull();
+    expect(session.responsesWsContinuationErrorReason).toBe("ws_continuation_unavailable");
+    expect(session.disableStreamingHedge).toHaveBeenCalled();
+  });
+
+  test("does not send an incremental request to another provider when its owner is disabled", async () => {
+    wsMocks.route.mockReturnValue({
+      providerId: 647,
+      endpointId: 22,
+      baseUrl: "https://winner.example/v1",
+    });
+    providerRepositoryMocks.findProviderById.mockResolvedValue(
+      makeProvider(647, { providerType: "codex", isEnabled: false })
+    );
+    const session = continuationSession();
+    await expect(ProxyProviderResolver.ensure(session)).rejects.toMatchObject({
+      name: "ResponsesWsContinuationError",
+    });
+    expect(session.getProvidersSnapshot).not.toHaveBeenCalled();
+  });
+
+  test("does not switch providers when the live socket owner reaches its concurrency limit", async () => {
+    wsMocks.route.mockReturnValue({
+      providerId: 647,
+      endpointId: 22,
+      baseUrl: "https://winner.example/v1",
+    });
+    providerRepositoryMocks.findProviderById.mockResolvedValue(
+      makeProvider(647, { providerType: "codex" })
+    );
+    rateLimitMocks.RateLimitService.checkAndTrackProviderSession.mockResolvedValue({
+      allowed: false,
+      count: 5,
+      tracked: false,
+      referenced: false,
+    });
+    const session = continuationSession();
+    await expect(ProxyProviderResolver.ensure(session)).rejects.toMatchObject({
+      name: "ResponsesWsContinuationError",
+    });
+    expect(session.getProvidersSnapshot).not.toHaveBeenCalled();
+  });
+
+  test("allows a stored continuation without a retained owner to use normal provider selection", async () => {
+    wsMocks.route.mockReturnValue(null);
+    const session = continuationSession();
+    session.request.message.store = true;
+    session.getProvidersSnapshot.mockResolvedValue([makeProvider(727, { providerType: "codex" })]);
+    expect(await ProxyProviderResolver.ensure(session)).toBeNull();
+    expect(session.provider.id).toBe(727);
+    expect(session.disableStreamingHedge).toHaveBeenCalled();
   });
 });

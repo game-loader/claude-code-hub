@@ -484,6 +484,77 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
     vi.restoreAllMocks();
   });
 
+  test("surfaces missing WS context before dispatch while preserving the recorded request context", async () => {
+    const session = createSession();
+    session.setProvider(createProvider({ providerType: "codex" }));
+    session.responsesWsContinuationErrorReason = "ws_continuation_unavailable";
+    const doForward = vi.spyOn(ProxyForwarder as any, "doForward");
+    await expect(ProxyForwarder.send(session)).rejects.toMatchObject({
+      name: "ResponsesWsContinuationError",
+      statusCode: 400,
+    });
+    expect(doForward).not.toHaveBeenCalled();
+    expect(mocks.getPreferredProviderEndpoints).not.toHaveBeenCalled();
+  });
+
+  test("rejects a changed provider before dispatching an incremental WS request", async () => {
+    const session = createSession();
+    session.setProvider(createProvider({ id: 727, providerType: "codex" }));
+    session.request.message = { previous_response_id: "resp_winner", store: false };
+    session.responsesWsContinuationRoute = {
+      providerId: 647,
+      endpointId: 22,
+      baseUrl: "https://winner.example/v1",
+    };
+    const doForward = vi.spyOn(ProxyForwarder as any, "doForward");
+    await expect(ProxyForwarder.send(session)).rejects.toMatchObject({
+      name: "ResponsesWsContinuationError",
+      statusCode: 400,
+    });
+    expect(doForward).not.toHaveBeenCalled();
+  });
+
+  test("pins a WS continuation to the successful endpoint and bypasses hedge and endpoint re-selection", async () => {
+    const provider = createProvider({
+      id: 647,
+      providerType: "codex",
+      firstByteTimeoutStreamingMs: 10,
+    });
+    const session = createSession();
+    setProviderWithSessionRef(session, provider);
+    session.originalFormat = "response";
+    session.requestUrl = new URL("https://example.com/v1/responses");
+    session.request.message = {
+      model: "gpt-5.5",
+      stream: true,
+      store: false,
+      previous_response_id: "resp_winner",
+      input: "delta",
+    };
+    session.responsesWsContinuationRoute = {
+      providerId: 647,
+      endpointId: 22,
+      baseUrl: "https://winner.example/v1",
+    };
+    mocks.isWebsocketClientRequest.mockReturnValue(true);
+    const doForward = vi
+      .spyOn(ProxyForwarder as any, "doForward")
+      .mockResolvedValue(
+        new Response(
+          'data: {"type":"response.output_text.delta","delta":"ok"}\n\ndata: {"type":"response.completed","response":{"id":"resp_next"}}\n\n',
+          { headers: { "content-type": "text/event-stream" } }
+        )
+      );
+    const response = await ProxyForwarder.send(session);
+    await response.text();
+    expect(doForward).toHaveBeenCalledTimes(1);
+    expect(doForward.mock.calls[0][2]).toBe("https://winner.example/v1");
+    expect(doForward.mock.calls[0][3]).toMatchObject({ endpointId: 22 });
+    expect(mocks.getPreferredProviderEndpoints).not.toHaveBeenCalled();
+    expect(mocks.pickRandomProviderWithExclusion).not.toHaveBeenCalled();
+    expect(session.isStreamingHedgeDisabled()).toBe(true);
+  });
+
   test("Discovery actively probes an unknown binding capability before acquiring its lease", async () => {
     const provider = createProvider({ id: 1 });
     const session = createSession();

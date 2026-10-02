@@ -22,6 +22,9 @@ import { findAllProviders, findProviderById } from "@/repository/provider";
 import { getGroupCostMultiplier } from "@/repository/provider-groups";
 import type { ProviderChainItem } from "@/types/message";
 import type { Provider } from "@/types/provider";
+import { isResponsesWsContinuationRequest } from "../responses-ws/continuation-routing";
+import { getResponsesWsSessionId } from "../responses-ws/eligibility";
+import { getResponsesWsContinuationRoute } from "../responses-ws/upstream-adapter";
 import { type AffinityLookupResult, getAffinityStore } from "./affinity/affinity-store";
 import { isAffinityRoutingEnabledWith } from "./affinity/config";
 import {
@@ -30,6 +33,7 @@ import {
   fingerprintTip,
 } from "./affinity/fingerprint";
 import { isClientAllowedDetailed } from "./client-detector";
+import { ResponsesWsContinuationError } from "./errors";
 import type { ClientFormat } from "./format-mapper";
 import { getVerboseProviderErrorCached } from "./provider-selector-settings-cache";
 import { ProxyResponses } from "./responses";
@@ -198,6 +202,41 @@ export class ProxyProviderResolver {
     // 动态尝试所有可用供应商（避免无限循环通过 excludedProviders 和 null 返回）
     const excludedProviders: number[] = [];
 
+    const wsContinuation = isResponsesWsContinuationRequest(
+      session.headers,
+      session.request.message
+    );
+    if (wsContinuation) {
+      session.disableStreamingHedge();
+      const route = getResponsesWsContinuationRoute(
+        getResponsesWsSessionId(session.headers),
+        session.request.message.previous_response_id as string
+      );
+      if (route) {
+        const provider = await ProxyProviderResolver.validateAffinityCandidate(
+          session,
+          route.providerId,
+          true
+        );
+        if (!provider)
+          throw new ResponsesWsContinuationError("ws_continuation_provider_unavailable");
+        session.responsesWsContinuationRoute = route;
+        session.setProvider(provider);
+        session.addProviderToChain(provider, {
+          reason: "session_reuse",
+          selectionMethod: "session_reuse",
+        });
+        logger.info("ProviderSelector: Pinned Responses WS continuation to its live socket", {
+          providerId: route.providerId,
+          endpointId: route.endpointId,
+        });
+      } else if (session.request.message.store === false) {
+        // Defer the recovery response until messageContext exists so this local
+        // failure remains visible in usage records. No upstream is dispatched.
+        session.responsesWsContinuationErrorReason = "ws_continuation_unavailable";
+      }
+    }
+
     // === F3a 前置：读一次运行时设置并计算指纹状态 ===
     // 「忽略客户端 Session ID」开启且请求可指纹化时，粘性交给最长前缀亲和，
     // 跳过 session-ID 绑定的读取；不可指纹化（如非 chat 体）仍走既有会话复用。
@@ -221,7 +260,7 @@ export class ProxyProviderResolver {
     }
 
     // === 会话复用（「忽略客户端 Session ID」语义下仅跳过读取；写路径不变）===
-    if (!skipSessionBinding) {
+    if (!skipSessionBinding && !session.responsesWsContinuationRoute) {
       const reusedProvider = await ProxyProviderResolver.findReusable(session);
       if (reusedProvider) {
         session.setProvider(reusedProvider);
@@ -331,6 +370,9 @@ export class ProxyProviderResolver {
         );
 
         if (!checkResult.allowed) {
+          if (session.responsesWsContinuationRoute) {
+            throw new ResponsesWsContinuationError("ws_continuation_provider_busy");
+          }
           // === 并发限制失败 ===
           logger.warn(
             "ProviderSelector: Provider concurrent session limit exceeded, trying fallback",
@@ -727,12 +769,13 @@ export class ProxyProviderResolver {
    */
   private static async validateAffinityCandidate(
     session: ProxySession,
-    providerId: number
+    providerId: number,
+    connectionContinuation = false
   ): Promise<Provider | null> {
     const provider = await findProviderById(providerId);
     if (!provider?.isEnabled) return null;
     // 尊重供应商的会话粘性 opt-out：亲和与会话复用同属粘性机制
-    if (provider.disableSessionReuse) return null;
+    if (provider.disableSessionReuse && !connectionContinuation) return null;
 
     const systemTimezone = await resolveSystemTimezone();
     if (!isProviderActiveNow(provider.activeTimeStart, provider.activeTimeEnd, systemTimezone)) {

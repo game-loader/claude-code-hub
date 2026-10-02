@@ -60,6 +60,8 @@
     "enableOpenaiResponsesWebsocketDesc": "啟用後，當客戶端以 WebSocket 連線 /v1/responses 且命中 Codex 類型供應商時，CCH 會嘗試與上游建立 WebSocket 連線。若上游不支援或握手失敗，將優雅降級為一般 HTTP Responses，客戶端 WebSocket 保持開啟；降級不計入熔斷。非 WebSocket 客戶端與非 Codex 供應商行為不變。",
     "enableHighConcurrencyMode": "啟用高並發模式",
     "enableHighConcurrencyModeDesc": "開啟後，將關閉部分 Redis 除錯快照與即時 Session 觀測寫入，以降低高並發下的 CPU 與 IO 開銷。轉發、整流、fake 200 偵測、計費與限額不受影響，但 Sessions 除錯詳情會減少或延後。",
+    "enableMemoryAdmission": "啟用記憶體准入",
+    "enableMemoryAdmissionDesc": "開啟後，請求本文與串流首內容緩衝依本機可用記憶體分配額度，額度不足時暫存到磁碟，仍然不足時回傳本地 429 並提示用戶端稍後重試。關閉時這些資料全部保留在記憶體中，不排隊，也不回傳本地 429。",
     "enableResponseFixer": "啟用回應整流",
     "enableResponseFixerDesc": "自動修復上游回應中常見的編碼、SSE 與 JSON 格式問題（預設開啟）。",
     "enableThinkingSignatureRectifier": "啟用 thinking 簽名整流器",
@@ -168,7 +170,7 @@
     "affinityIgnoreClientSessionId": "忽略用戶端 Session ID",
     "affinityIgnoreClientSessionIdDesc": "開啟後，可指紋化的請求強制使用最長前綴親和做供應商黏性（跳過用戶端 Session ID 綁定）；不可指紋化的請求仍走會話複用。預設開啟。",
     "streamGateMode": "串流內容閘控",
-    "streamGateModeDesc": "控制一般請求的首個有效內容影格閘控：啟用時遇到錯誤影格或空串流會自動切換供應商重試，影子模式僅旁路統計判定分歧，關閉時直接轉發。Replay owner 無論選擇哪種模式，始終保留首內容前的安全判定。預設啟用。",
+    "streamGateModeDesc": "控制一般請求的首個有效內容影格閘控：啟用時遇到錯誤影格或空串流會自動切換供應商重試，影子模式僅旁路統計判定分歧，關閉時直接轉發。影子模式與關閉時首位元組立即透傳給客戶端，Replay owner 也不例外；開啟高併發模式等同於關閉。預設啟用。",
     "streamGateModeOptions": {
       "off": "關閉",
       "shadow": "影子模式",

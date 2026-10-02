@@ -60,6 +60,8 @@
     "enableOpenaiResponsesWebsocketDesc": "When enabled, if a client opens a WebSocket connection to /v1/responses and the selected provider is a Codex type, CCH will attempt a sibling WebSocket to the upstream. If the upstream does not support WebSocket or the handshake fails, CCH gracefully falls back to standard HTTP Responses while keeping the client WebSocket open; the fallback is not counted toward circuit breakers. Non-WebSocket clients and non-Codex providers are unaffected.",
     "enableHighConcurrencyMode": "Enable High-Concurrency Mode",
     "enableHighConcurrencyModeDesc": "When enabled, CCH disables part of the Redis debug snapshots and real-time session observability writes to reduce CPU and IO pressure under high RPM. Forwarding, rectifiers, fake-200 detection, billing, and quota enforcement remain unchanged, but Sessions debugging details may be reduced or delayed.",
+    "enableMemoryAdmission": "Enable Memory Admission",
+    "enableMemoryAdmissionDesc": "When enabled, request bodies and the stream buffer before first content are admitted against this machine's available memory. When the budget runs short they are written to disk, and if that is not enough CCH returns a local 429 asking the client to retry later. When disabled, this data stays in memory without queuing and no local 429 is returned.",
     "enableResponseFixer": "Enable Response Fixer",
     "enableResponseFixerDesc": "Automatically repairs common upstream response issues (encoding, SSE, truncated JSON). Enabled by default.",
     "enableThinkingSignatureRectifier": "Enable Thinking Signature Rectifier",
@@ -168,7 +170,7 @@
     "affinityIgnoreClientSessionId": "Ignore Client Session ID",
     "affinityIgnoreClientSessionIdDesc": "When enabled, fingerprintable requests are forced to use longest-prefix affinity for provider stickiness (skipping client Session ID binding); non-fingerprintable requests still use session reuse. Default on.",
     "streamGateMode": "Stream Content Gate",
-    "streamGateModeDesc": "Controls the first-valid-content gate for ordinary requests: enabled mode fails over on error frames or empty streams, shadow mode only records divergence, and off mode forwards directly. Replay owners always retain the pre-content safety gate regardless of this setting. Default enabled.",
+    "streamGateModeDesc": "Controls the first-valid-content gate for ordinary requests: enabled mode fails over on error frames or empty streams, shadow mode only records divergence, and off mode forwards directly. Shadow and off modes deliver the first upstream byte immediately, including for replay owners; high-concurrency mode is treated as off. Default enabled.",
     "streamGateModeOptions": {
       "off": "Off",
       "shadow": "Shadow mode",

@@ -1169,9 +1169,28 @@ async function main() {
     process.env[INTERNAL_SECRET_ENV] = randomUUID();
   }
 
-  const app = nextFactory({ dev, hostname, port });
+  // Next lazily installs its upgrade listener on the supplied HTTP server.
+  // Keep it on the private bridge so it cannot close public Responses sockets.
+  const internalServer = http.createServer();
+  const app = nextFactory({ dev, hostname, port, httpServer: internalServer });
   const handler = app.getRequestHandler();
   await app.prepare();
+  // 基础加载完成后再建立单进程/worker 预算；与 Next bundle 通过 Symbol 共享实例。
+  const { getMemoryGovernor } = require("./server-lib/memory-governor");
+  const memoryGovernor = getMemoryGovernor();
+  const { getSpoolBudget } = require("./server-lib/spool-directory");
+  const memoryIdentity = { pid: process.pid, workerIndex: Number(process.env.CCH_MULTICORE_WORKER_INDEX || 0) };
+  log("info", "worker_memory_ready", { ...memoryIdentity, ...memoryGovernor.snapshot() });
+  const memoryStatsTimer = setInterval(() => {
+    // Next bundle 首次处理代理请求后才注册；用于定位响应已结束却仍被后台所有者占用的请求内存。
+    const requestMemory = globalThis[Symbol.for("cch.requestMemoryStats")]?.();
+    log("info", "worker_memory_stats", { ...memoryIdentity, ...memoryGovernor.snapshot(), requestMemory, processMemory: process.memoryUsage(), spool: getSpoolBudget() });
+  }, 30000);
+  memoryStatsTimer.unref();
+  if (process.env.CCH_MULTICORE_BACKGROUND_OWNER !== "0") {
+    const { startSpoolCleanup } = require("./server-lib/spool-directory");
+    startSpoolCleanup({ onError: (error) => log("warn", "spool_cleanup_failed", { error: String(error) }) });
+  }
 
   const requestListener = async (req, res) => {
     try {
@@ -1190,7 +1209,7 @@ async function main() {
 
   // WebSocket frame 必须重新进入持有客户端连接和持久上游会话的同一个 worker。
   // 私有独占 listener 无需经 IPC 复制请求正文即可保证这一不变量。
-  const internalServer = http.createServer(requestListener);
+  internalServer.on("request", requestListener);
   const internalHttpTarget = await listenOnPrivateLoopback(internalServer);
   const server = http.createServer(requestListener);
 

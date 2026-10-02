@@ -227,12 +227,17 @@ export const SystemSettingsSchema = z
     streamGateMode: z
       .enum(["off", "shadow", "enforce"])
       .describe(
-        "Stream content gate mode for ordinary requests: buffer until the first valid content frame and fail over on error or empty streams (enforce), observe divergence only (shadow), or disable (off). Replay owners always retain the pre-content safety gate."
+        "Stream content gate mode for ordinary requests: buffer until the first valid content frame and fail over on error or empty streams (enforce), observe divergence only (shadow), or disable (off). Shadow and off deliver the first upstream byte immediately, including for replay owners; high-concurrency mode is treated as off."
       ),
     affinityIgnoreClientSessionId: z
       .boolean()
       .describe(
         "Whether fingerprintable requests force longest-prefix affinity for provider stickiness, skipping client session id binding."
+      ),
+    enableMemoryAdmission: z
+      .boolean()
+      .describe(
+        "Whether local memory admission is enabled. When enabled, request bodies and stream gate prefixes are admitted against the available memory budget, spill to disk, and return a local 429 when capacity runs out. When disabled, they stay in memory without queuing or local 429."
       ),
     replayEnabled: z
       .boolean()

@@ -115,6 +115,10 @@ vi.mock("@/lib/config/env.schema", async (importOriginal) => {
 });
 
 import { ProxyProviderResolver } from "@/app/v1/_lib/proxy/provider-selector";
+import {
+  clearResponsesWsRecoveryStateForTests,
+  rememberResponsesWsRecoveryFailure,
+} from "@/app/v1/_lib/responses-ws/recovery-state";
 
 function makeProvider(id: number, overrides: Partial<Provider> = {}): Provider {
   return {
@@ -191,6 +195,7 @@ function makeSession(overrides: Record<string, unknown> = {}): any {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  clearResponsesWsRecoveryStateForTests();
   envControl.affinityEnabled = true;
   settingsControl.ignoreClientSessionId = true;
   storeMocks.lookup.mockResolvedValue(null);
@@ -460,5 +465,36 @@ describe("Responses WS continuation routing", () => {
     expect(await ProxyProviderResolver.ensure(session)).toBeNull();
     expect(session.provider.id).toBe(727);
     expect(session.disableStreamingHedge).toHaveBeenCalled();
+  });
+});
+
+describe("full-context recovery after a failed continuation", () => {
+  test("skips the failed priority-zero provider, session binding and affinity on the replay", async () => {
+    const session = makeSession({
+      headers: new Headers({ "thread-id": "recovery-thread" }),
+      sessionId: "recovery-session",
+      originalFormat: "response",
+      request: { message: { model: "gpt-5.5", input: "full context" } },
+      getOriginalModel: () => "gpt-5.5",
+      shouldReuseProvider: () => true,
+      getProvidersSnapshot: vi.fn(async () => [
+        makeProvider(792, { providerType: "codex", priority: 0 }),
+        makeProvider(647, { providerType: "codex", priority: 1 }),
+      ]),
+    });
+    sessionManagerMocks.SessionManager.getSessionProvider.mockResolvedValue(792);
+    storeMocks.lookup.mockResolvedValue({
+      generation: "1",
+      identityFp: "rootfp",
+      hint: { providerId: 792, matchedFp: "fp", matchedIndex: 0 },
+    });
+    await rememberResponsesWsRecoveryFailure(session, 792);
+    expect(await ProxyProviderResolver.ensure(session)).toBeNull();
+    expect(session.provider.id).toBe(647);
+    expect(sessionManagerMocks.SessionManager.getSessionProvider).not.toHaveBeenCalled();
+    expect(storeMocks.lookup).not.toHaveBeenCalled();
+    expect(await ProxyProviderResolver.pickRandomProviderWithExclusion(session, [])).toMatchObject({
+      id: 647,
+    });
   });
 });

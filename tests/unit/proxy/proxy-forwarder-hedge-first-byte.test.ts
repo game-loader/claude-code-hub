@@ -514,6 +514,43 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
     expect(doForward).not.toHaveBeenCalled();
   });
 
+  test.each([524, 502])(
+    "requests full-context recovery after continuation status %s without vendor-wide timeout attribution",
+    async (status) => {
+      const session = createSession();
+      session.originalFormat = "response";
+      session.requestUrl = new URL("https://example.com/v1/responses");
+      session.request.message = {
+        model: "gpt-5.5",
+        stream: true,
+        store: false,
+        previous_response_id: "resp_old",
+        input: "delta",
+      };
+      const provider = createProvider({ id: 792, providerType: "codex", providerVendorId: 12 });
+      session.setProvider(provider);
+      session.responsesWsContinuationRoute = {
+        providerId: 792,
+        endpointId: 33,
+        baseUrl: "https://old.example/v1",
+      };
+      mocks.isWebsocketClientRequest.mockReturnValue(true);
+      const original = new UpstreamProxyError("upstream diagnostic", status, {
+        providerId: 792,
+        providerName: "q792",
+      });
+      const doForward = vi.spyOn(ProxyForwarder as any, "doForward").mockRejectedValue(original);
+      await expect(ProxyForwarder.send(session)).rejects.toMatchObject({
+        name: "ResponsesWsContinuationError",
+        statusCode: 400,
+      });
+      expect(doForward).toHaveBeenCalledTimes(1);
+      expect(mocks.recordVendorTypeAllEndpointsTimeout).not.toHaveBeenCalled();
+      expect(mocks.pickRandomProviderWithExclusion).not.toHaveBeenCalled();
+      expect(session.getProviderChain().some((item) => item.statusCode === status)).toBe(true);
+    }
+  );
+
   test("pins a WS continuation to the successful endpoint and bypasses hedge and endpoint re-selection", async () => {
     const provider = createProvider({
       id: 647,

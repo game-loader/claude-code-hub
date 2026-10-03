@@ -86,6 +86,8 @@ import {
 } from "../responses-ws/eligibility";
 import { RESERVED_INTERNAL_HEADERS } from "../responses-ws/internal-secret";
 import { shouldReconnectResponsesWs } from "../responses-ws/reconnect-policy";
+import { shouldRecoverResponsesWsFailure } from "../responses-ws/recovery-policy";
+import { rememberResponsesWsRecoveryFailure } from "../responses-ws/recovery-state";
 import { getResponsesWsFirstEventTimeoutMs } from "../responses-ws/timeout-policy";
 import { markResponsesWsUnsupported } from "../responses-ws/unsupported-cache";
 import { tryResponsesWebsocketUpstream } from "../responses-ws/upstream-adapter";
@@ -1683,6 +1685,29 @@ export class ProxyForwarder {
       return await ProxyForwarder.sendInternal(session);
     } catch (error) {
       await abortReplayOwnership(session, "forward_failed");
+      if (shouldRecoverResponsesWsFailure(session, error)) {
+        const failure =
+          error instanceof ResponsesWsContinuationError
+            ? error
+            : new ResponsesWsContinuationError("ws_provider_failure");
+        const lostWithoutDispatch =
+          error instanceof ResponsesWsContinuationError &&
+          [
+            "ws_continuation_unavailable",
+            "ws_module_unavailable",
+            "setting_disabled",
+            "provider_not_codex",
+          ].includes(error.reason);
+        if (session.provider && !lostWithoutDispatch) {
+          await rememberResponsesWsRecoveryFailure(session, session.provider.id);
+        }
+        logger.info("ProxyForwarder: Recovering failed WS continuation with full context", {
+          providerId: session.provider?.id,
+          originalStatusCode: error instanceof ProxyError ? error.statusCode : undefined,
+          recoveryReason: failure.reason,
+        });
+        throw failure;
+      }
       throw error;
     }
   }
@@ -3093,6 +3118,7 @@ export class ProxyForwarder {
 
             if (
               !isMcpRequest &&
+              !wsContinuation &&
               statusCode === 524 &&
               currentProvider.providerVendorId &&
               endpointCandidateKeys.size > 0 &&
@@ -4208,6 +4234,9 @@ export class ProxyForwarder {
               endpointUrl: baseUrl || provider.url,
               abortSignal: transportController.signal,
               onUpstreamDispatch,
+              onContinuationRecovery: async () => {
+                await rememberResponsesWsRecoveryFailure(session, provider.id);
+              },
             };
             let wsResult = await tryResponsesWebsocketUpstream(wsOptions);
             transportController.signal.throwIfAborted();
@@ -4249,6 +4278,19 @@ export class ProxyForwarder {
                 session.upstreamTransport = null;
               }
               if (responsesWsContinuation) {
+                if (wsResult.reason === "ws_payload_too_large")
+                  throw new ProxyError(wsResult.message ?? wsResult.reason, 413);
+                const upgradeStatus =
+                  wsResult.reason === "ws_upgrade_rejected"
+                    ? Number(wsResult.message?.match(/^HTTP (\d{3})\b/)?.[1])
+                    : NaN;
+                if (
+                  upgradeStatus >= 400 &&
+                  upgradeStatus < 500 &&
+                  ![408, 429].includes(upgradeStatus)
+                ) {
+                  throw new ProxyError(wsResult.message ?? wsResult.reason, upgradeStatus);
+                }
                 throw new ResponsesWsContinuationError(wsResult.reason);
               }
               // Record definitive protocol rejections for diagnostics only.
@@ -4296,6 +4338,13 @@ export class ProxyForwarder {
             ? transportController.signal.reason
             : new DOMException("The request was aborted", "AbortError");
         }
+        if (
+          wsError instanceof ProxyError &&
+          !(wsError instanceof ResponsesWsContinuationError) &&
+          wsError.statusCode < 500 &&
+          ![408, 429].includes(wsError.statusCode)
+        )
+          throw wsError;
         if (
           responsesWsContinuation ||
           (!responsesWsContinuationChecked &&

@@ -25,6 +25,7 @@
 const http = require("node:http");
 const { randomUUID } = require("node:crypto");
 const { parse } = require("node:url");
+const { normalizeResponsesWsRecoveryEvent } = require("./server-lib/responses-ws-recovery");
 
 function isNextDevMode(nodeEnv) {
   return nodeEnv !== "production";
@@ -564,6 +565,10 @@ async function forwardToInternalHttp(
             log("warn", "ws_client_close_failed", { error: String(err) });
           }
         };
+  const continuation =
+    typeof body.previous_response_id === "string" && body.previous_response_id.length > 0;
+  const sendToClient = (clientSocket, event, options) =>
+    safeSend(clientSocket, normalizeResponsesWsRecoveryEvent(event, continuation), options);
   const internalHeaders = {};
   for (const [k, v] of Object.entries(originalReq.headers)) {
     const lower = k.toLowerCase();
@@ -684,7 +689,7 @@ async function forwardToInternalHttp(
         const sendFatalError = (code, message, closeReason) => {
           if (responseSettled || terminalFailureQueued) return false;
           terminalFailureQueued = true;
-          const sent = safeSend(
+          const sent = sendToClient(
             ws,
             { type: "error", error: { code, message } },
             {
@@ -730,7 +735,7 @@ async function forwardToInternalHttp(
             }
             const isHttpError = !!(res.statusCode && res.statusCode >= 400);
             if (isHttpError) {
-              safeSend(
+              sendToClient(
                 ws,
                 {
                   type: "error",
@@ -748,7 +753,7 @@ async function forwardToInternalHttp(
                 status: res.statusCode,
               });
             } else {
-              safeSend(
+              sendToClient(
                 ws,
                 { type: "response.completed", response: parsed },
                 { response: res, onSuccess: acknowledgeTerminalSend, onFailure: settleAndClose }
@@ -830,7 +835,7 @@ async function forwardToInternalHttp(
                 // Some upstreams close SSE with [DONE] without a preceding
                 // response.completed. Synthesize one so the client sees a
                 // clean terminal event.
-                safeSend(ws, { type: "response.completed", response: null }, {
+                sendToClient(ws, { type: "response.completed", response: null }, {
                   response: res,
                   onSuccess: acknowledgeTerminalSend,
                   onFailure: settleAndClose,
@@ -844,7 +849,7 @@ async function forwardToInternalHttp(
               event = JSON.parse(dataText);
             } catch {
               // Not JSON; forward as raw string event.
-              safeSend(ws, { type: "response.output_text.delta", delta: dataText }, {
+              sendToClient(ws, { type: "response.output_text.delta", delta: dataText }, {
                 response: res,
                 onFailure: settleAndClose,
               });
@@ -852,7 +857,7 @@ async function forwardToInternalHttp(
             }
             const isTerminalEvent =
               event && typeof event.type === "string" && TERMINAL_EVENT_TYPES.has(event.type);
-            safeSend(ws, event, {
+            sendToClient(ws, event, {
               response: res,
               onSuccess: isTerminalEvent ? acknowledgeTerminalSend : undefined,
               onFailure: settleAndClose,
@@ -963,7 +968,7 @@ async function forwardToInternalHttp(
         initiateClose(1011, "internal_request_error");
         resolve();
       };
-      const sent = safeSend(
+      const sent = sendToClient(
         ws,
         {
           type: "error",
@@ -1011,7 +1016,7 @@ async function forwardToInternalHttp(
           initiateClose(1011, "internal_request_body_closed");
           resolve();
         };
-        const sent = safeSend(
+        const sent = sendToClient(
           ws,
           {
             type: "error",
@@ -1037,7 +1042,7 @@ async function forwardToInternalHttp(
         initiateClose(1011, "internal_request_drain_timeout");
         resolve();
       };
-      const sent = safeSend(
+      const sent = sendToClient(
         ws,
         {
           type: "error",

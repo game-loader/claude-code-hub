@@ -1625,6 +1625,97 @@ faultRun("Codex CLI through CCH WebSocket fault injection", () => {
     assertNoResetWithoutClosingHandshake(result);
   }, 70_000);
 
+  test.each(["timeout-524", "error-frame-502", "broken-stream"])(
+    "recovers continuation %s with full input and excludes the failed channel",
+    async (fault) => {
+      if (!cchFaultHarness) throw new Error("CCH fault harness is not initialized");
+      const {
+        clearResponsesWsRecoveryStateForTests,
+        getResponsesWsRecoveryExcludedProviderIds,
+        rememberResponsesWsRecoveryFailure,
+      } = await import("@/app/v1/_lib/responses-ws/recovery-state");
+      clearResponsesWsRecoveryStateForTests();
+      const bodies: Array<Record<string, unknown>> = [];
+      let injected = false;
+      let replayAvoidedFailure = false;
+      cchFaultHarness.setResponseHandler(async ({ req, res, body }) => {
+        bodies.push(body);
+        const recoverySession = {
+          headers: new Headers(
+            Object.entries(req.headers).flatMap(([key, value]) =>
+              typeof value === "string" ? [[key, value]] : []
+            )
+          ),
+          sessionId: "test-recovery-thread",
+          authState: { key: { id: 5 } },
+          request: { message: body },
+          getOriginalModel: () => model,
+        } as unknown as import("@/app/v1/_lib/proxy/session").ProxySession;
+        if (typeof body.previous_response_id === "string" && !injected) {
+          injected = true;
+          await rememberResponsesWsRecoveryFailure(recoverySession, 792);
+          if (fault === "timeout-524") {
+            res.writeHead(524, { "content-type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error: { code: "timeout_error", message: "Provider failed to respond" },
+              })
+            );
+          } else {
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.write(eventChunk({ type: "response.created", response: { id: "resp_fault" } }));
+            if (fault === "error-frame-502")
+              res.end(
+                eventChunk({
+                  type: "error",
+                  status: 502,
+                  error: { code: "server_error", message: "upstream unavailable" },
+                })
+              );
+            else setTimeout(() => res.socket?.destroy(), 10);
+          }
+          return;
+        }
+        if (injected && body.previous_response_id == null) {
+          replayAvoidedFailure = (
+            await getResponsesWsRecoveryExcludedProviderIds(recoverySession)
+          ).includes(792);
+        }
+        await writeFragmentedSse(
+          res,
+          responseEvents(`resp_recovery_${bodies.length}`, body.generate !== false),
+          0
+        );
+      });
+      try {
+        const result = await runCodex(cchFaultHarness.port, invocation, { timeoutMs: 60_000 });
+        expect(result.code).toBe(0);
+        expect(injected).toBe(true);
+        expect(replayAvoidedFailure).toBe(true);
+        expect(`${result.stdout}\n${result.stderr}`).toContain(responseText);
+        const failedIndex = bodies.findIndex(
+          (body) => typeof body.previous_response_id === "string"
+        );
+        const replay = bodies
+          .slice(failedIndex + 1)
+          .find((body) => body.previous_response_id == null);
+        expect(replay).toBeDefined();
+        const withoutIds = (input: unknown) =>
+          (Array.isArray(input) ? input : []).map(
+            ({ id: _id, ...item }: Record<string, unknown>) => item
+          );
+        expect(withoutIds(replay?.input)).toEqual([
+          ...withoutIds(bodies[0]?.input),
+          ...withoutIds(bodies[failedIndex]?.input),
+        ]);
+        assertNoResetWithoutClosingHandshake(result);
+      } finally {
+        clearResponsesWsRecoveryStateForTests();
+      }
+    },
+    70_000
+  );
+
   test("surfaces abrupt upstream response destruction to Codex without reset noise", async () => {
     if (!cchFaultHarness) throw new Error("CCH fault harness is not initialized");
     cchFaultHarness.events.length = 0;

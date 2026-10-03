@@ -386,11 +386,11 @@ describe("ProxyForwarder raw passthrough regression", () => {
         ) => Promise<Response>;
       };
 
-      await expect(doForward(session, provider, provider.url)).rejects.toMatchObject({
-        name: "ResponsesWsContinuationError",
-        statusCode: 400,
-        reason,
-      });
+      await expect(doForward(session, provider, provider.url)).rejects.toMatchObject(
+        reason === "ws_payload_too_large"
+          ? { name: "ProxyError", statusCode: 413 }
+          : { name: "ResponsesWsContinuationError", statusCode: 400, reason }
+      );
       expect(fetchWithoutAutoDecode).not.toHaveBeenCalled();
       expect(mocks.tryResponsesWebsocketUpstream).toHaveBeenCalledTimes(1);
       expect(isResponsesWsUnsupported(provider.id)).toEqual({ unsupported: false });

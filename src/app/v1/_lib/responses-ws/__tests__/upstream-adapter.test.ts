@@ -158,6 +158,117 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
 describe("tryResponsesWebsocketUpstream", () => {
   let server: ServerHandle | null = null;
 
+  it("does not emit a recovery frame after the client cancels during recovery notification", async () => {
+    let messages = 0;
+    server = await startMockServer((socket) =>
+      socket.on("message", () => {
+        if (++messages === 1)
+          socket.send(
+            JSON.stringify({ type: "response.completed", response: { id: "resp_base" } })
+          );
+        else
+          socket.send(
+            JSON.stringify({
+              type: "error",
+              status: 502,
+              error: { code: "server_error", message: "unavailable" },
+            })
+          );
+      })
+    );
+    const common = {
+      provider: codexProvider(),
+      upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+      upstreamHeaders: new Headers(),
+      sessionId: "cancel-recovery",
+    };
+    const first = await tryResponsesWebsocketUpstream({
+      ...common,
+      body: { input: "full", store: false },
+    });
+    if (!("response" in first)) throw new Error("expected first response");
+    await collectSseBody(first.response);
+    let notified!: () => void;
+    let release!: () => void;
+    const notification = new Promise<void>((resolve) => {
+      notified = resolve;
+    });
+    const waiting = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const next = await tryResponsesWebsocketUpstream({
+      ...common,
+      onContinuationRecovery: async () => {
+        notified();
+        await waiting;
+      },
+      body: { store: false, previous_response_id: "resp_base", input: "delta" },
+    });
+    if (!("response" in next)) throw new Error("expected continuation response");
+    const reader = next.response.body!.getReader();
+    await notification;
+    const cancel = reader.cancel();
+    release();
+    await cancel;
+    expect(await reader.read()).toMatchObject({ done: true });
+  });
+
+  it.each(["error-frame", "upstream-disconnect", "request-error"])(
+    "recovers continuation %s while preserving non-retryable errors",
+    async (fault) => {
+      let messages = 0;
+      server = await startMockServer((socket) => {
+        socket.on("message", () => {
+          if (++messages === 1) {
+            socket.send(
+              JSON.stringify({ type: "response.completed", response: { id: "resp_base" } })
+            );
+            return;
+          }
+          socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_next" } }));
+          if (fault === "upstream-disconnect") {
+            socket.terminate();
+            return;
+          }
+          socket.send(
+            JSON.stringify({
+              type: "error",
+              status: fault === "request-error" ? 401 : 502,
+              error: {
+                code: fault === "request-error" ? "invalid_api_key" : "server_error",
+                message: "original diagnostic",
+              },
+            })
+          );
+        });
+      });
+      const common = {
+        provider: codexProvider(),
+        upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+        upstreamHeaders: new Headers(),
+        sessionId: "recover-continuation",
+      };
+      const first = await tryResponsesWebsocketUpstream({
+        ...common,
+        body: { input: "full", store: false },
+      });
+      if (!("response" in first)) throw new Error("expected first response");
+      await collectSseBody(first.response);
+      const onContinuationRecovery = vi.fn(async () => {});
+      const next = await tryResponsesWebsocketUpstream({
+        ...common,
+        onContinuationRecovery,
+        body: { store: false, previous_response_id: "resp_base", input: "delta" },
+      });
+      if (!("response" in next)) throw new Error("expected continuation response");
+      const body = await collectSseBody(next.response);
+      expect(body).toContain(
+        fault === "request-error" ? "invalid_api_key" : "previous_response_not_found"
+      );
+      expect(onContinuationRecovery).toHaveBeenCalledTimes(fault === "request-error" ? 0 : 1);
+    }
+  );
+
   it("expires all route entries after idle timeout and ignores cleanup for other clients", async () => {
     server = await startMockServer((socket) => {
       socket.on("message", () =>

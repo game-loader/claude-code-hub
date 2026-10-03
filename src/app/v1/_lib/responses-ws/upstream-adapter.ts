@@ -21,6 +21,7 @@ import type { Provider } from "@/types/provider";
 import { hasResponsesWsContinuation } from "./continuation";
 import { RESERVED_INTERNAL_HEADERS } from "./internal-secret";
 import { getUpstreamPayloadTooLargeMessage } from "./payload-too-large";
+import { normalizeResponsesWsRecoveryEvent } from "./recovery-policy";
 import { getResponsesWsFirstEventTimeoutMs } from "./timeout-policy";
 
 declare global {
@@ -463,6 +464,7 @@ export async function tryResponsesWebsocketUpstream(options: {
   endpointUrl?: string;
   abortSignal?: AbortSignal;
   onUpstreamDispatch?: () => void;
+  onContinuationRecovery?: () => Promise<void>;
 }): Promise<UpstreamWsResult> {
   const WsCtor = (await loadWsModule()) as
     | (typeof WebSocketType & { new (url: string, opts?: unknown): WebSocketType })
@@ -490,6 +492,8 @@ export async function tryResponsesWebsocketUpstream(options: {
   const firstEventTimeoutMs = getResponsesWsFirstEventTimeoutMs(
     options.provider.firstByteTimeoutStreamingMs ?? 0
   );
+  const continuation = hasResponsesWsContinuation(options.body);
+  const onContinuationRecovery = options.onContinuationRecovery;
 
   // 握手期间只保留发送所需字符串；send() 接管后立即断开本地引用。后续流事件
   // 监听器不得闭包捕获完整 options，否则整份请求 body 会滞留到生成结束。
@@ -990,7 +994,28 @@ export async function tryResponsesWebsocketUpstream(options: {
     resumeUpstreamIfNeeded(true);
   };
 
-  const processText = (text: string): { bytes: Uint8Array; terminal: boolean } => {
+  const processText = async (text: string): Promise<{ bytes: Uint8Array; terminal: boolean }> => {
+    let event: unknown;
+    try {
+      event = JSON.parse(text);
+    } catch {
+      /* Preserve non-JSON text. */
+    }
+    const normalized = normalizeResponsesWsRecoveryEvent(event, continuation);
+    if (normalized !== event) {
+      logger.warn("[ResponsesWsAdapter] recovering upstream continuation error", {
+        providerId: route.providerId,
+        ...normalized.cch_recovery,
+      });
+      await onContinuationRecovery?.();
+      text = JSON.stringify(normalized);
+    } else if (
+      continuation &&
+      normalized?.type === "error" &&
+      normalized.error?.code === "previous_response_not_found"
+    ) {
+      await onContinuationRecovery?.();
+    }
     const bytes = encodeSseData(text, encoder);
     if (!bytes) {
       const failure = {
@@ -1010,7 +1035,7 @@ export async function tryResponsesWebsocketUpstream(options: {
 
     let terminal = false;
     try {
-      const parsed = JSON.parse(text);
+      const parsed = normalized;
       if (parsed && typeof parsed.type === "string" && TERMINAL_EVENT_TYPES.has(parsed.type)) {
         if (persistentEntry && parsed.type !== "response.completed") {
           persistentEntry.responseId = null;
@@ -1063,7 +1088,8 @@ export async function tryResponsesWebsocketUpstream(options: {
 
       if (streamFinished) return;
       if (next !== undefined) {
-        const processed = processText(next);
+        const processed = await processText(next);
+        if (streamFinished) return;
         controller.enqueue(processed.bytes);
         if (processed.terminal) completeTerminal(controller);
         return;
@@ -1073,7 +1099,8 @@ export async function tryResponsesWebsocketUpstream(options: {
       // raced with the wake-up before declaring the upstream truncated.
       next = popMessage();
       if (next !== undefined) {
-        const processed = processText(next);
+        const processed = await processText(next);
+        if (streamFinished) return;
         controller.enqueue(processed.bytes);
         if (processed.terminal) completeTerminal(controller);
         return;
@@ -1083,8 +1110,9 @@ export async function tryResponsesWebsocketUpstream(options: {
         code: "upstream_ws_mid_stream_error",
         message: "upstream WebSocket closed before emitting a terminal response event",
       };
-      const errorFrame = JSON.stringify({ type: "error", error: failure });
-      controller.enqueue(encodeSseData(errorFrame, encoder)!);
+      const processed = await processText(JSON.stringify({ type: "error", error: failure }));
+      if (streamFinished) return;
+      controller.enqueue(processed.bytes);
       streamFinished = true;
       controller.close();
       finishRequest({ closeCode: 1011, forgetSession: true });

@@ -24,6 +24,7 @@ import type { ProviderChainItem } from "@/types/message";
 import type { Provider } from "@/types/provider";
 import { isResponsesWsContinuationRequest } from "../responses-ws/continuation-routing";
 import { getResponsesWsSessionId } from "../responses-ws/eligibility";
+import { getResponsesWsRecoveryExcludedProviderIds } from "../responses-ws/recovery-state";
 import { getResponsesWsContinuationRoute } from "../responses-ws/upstream-adapter";
 import { type AffinityLookupResult, getAffinityStore } from "./affinity/affinity-store";
 import { isAffinityRoutingEnabledWith } from "./affinity/config";
@@ -200,7 +201,11 @@ export class ProxyProviderResolver {
     }
 
     // 动态尝试所有可用供应商（避免无限循环通过 excludedProviders 和 null 返回）
-    const excludedProviders: number[] = [];
+    const excludedProviders = await getResponsesWsRecoveryExcludedProviderIds(session);
+    const recoveringFullContext =
+      excludedProviders.length > 0 &&
+      !isResponsesWsContinuationRequest(session.headers, session.request.message);
+    if (recoveringFullContext) session.setProvider(null);
 
     const wsContinuation = isResponsesWsContinuationRequest(
       session.headers,
@@ -260,7 +265,7 @@ export class ProxyProviderResolver {
     }
 
     // === 会话复用（「忽略客户端 Session ID」语义下仅跳过读取；写路径不变）===
-    if (!skipSessionBinding && !session.responsesWsContinuationRoute) {
+    if (!skipSessionBinding && !session.responsesWsContinuationRoute && !recoveringFullContext) {
       const reusedProvider = await ProxyProviderResolver.findReusable(session);
       if (reusedProvider) {
         session.setProvider(reusedProvider);
@@ -307,7 +312,7 @@ export class ProxyProviderResolver {
     }
 
     // === 前缀亲和提名（优先级：显式 session 绑定 > 亲和 > 加权随机）===
-    if (affinityRoutingEnabled && !session.provider) {
+    if (affinityRoutingEnabled && !session.provider && !recoveringFullContext) {
       await ProxyProviderResolver.tryPrefixAffinityNomination(session);
     }
 
@@ -1153,6 +1158,11 @@ export class ProxyProviderResolver {
     provider: Provider | null;
     context: NonNullable<ProviderChainItem["decisionContext"]>;
   }> {
+    if (session) {
+      excludeIds = [
+        ...new Set([...excludeIds, ...(await getResponsesWsRecoveryExcludedProviderIds(session))]),
+      ];
+    }
     // 使用 Session 快照保证故障迁移期间数据一致性
     // 如果没有 session，回退到 findAllProviders（内部已使用缓存）
     const allProviders = session ? await session.getProvidersSnapshot() : await findAllProviders();

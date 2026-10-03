@@ -52,6 +52,8 @@ import type { SessionUsageUpdate } from "@/types/session";
 import type { LongContextPricingSpecialSetting } from "@/types/special-settings";
 import { GeminiAdapter } from "../gemini/adapter";
 import type { GeminiResponse } from "../gemini/types";
+import { isResponsesWsContinuationRequest } from "../responses-ws/continuation-routing";
+import { rememberResponsesWsRecoveryFailure } from "../responses-ws/recovery-state";
 import { extractActualResponseModelForProvider, extractJsonChunks } from "./actual-response-model";
 import { recordAffinityWinner, tombstoneAffinityOnFailure } from "./affinity/affinity-recorder";
 import { bindClientAbortListener } from "./client-abort-listener";
@@ -5531,6 +5533,12 @@ export class ProxyResponseHandler {
         // would let a later client disconnect overwrite an earlier Provider timeout/error.
         const clientAborted = pumpClientAborted;
         const isResponseControllerAborted = err === winningResponseControllerAbortError;
+        if (
+          !clientAborted &&
+          isResponsesWsContinuationRequest(session.headers, session.request.message)
+        ) {
+          await rememberResponsesWsRecoveryFailure(session, provider.id);
+        }
 
         if (isClientAbortError(err)) {
           // 区分不同的超时来源

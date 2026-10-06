@@ -28,8 +28,6 @@ describe("getUpstreamPayloadTooLargeMessage", () => {
     "request body too large",
     "body too large",
     "content too large",
-    "context length",
-    "context too large",
     "maximum bytes",
     "max bytes",
     "image exceeds",
@@ -61,11 +59,7 @@ describe("getUpstreamPayloadTooLargeMessage", () => {
 
   it.each([400, 422, 507])("recognizes machine size codes for status %i", (status) => {
     for (const field of ["code", "type"]) {
-      for (const signal of [
-        "request_payload_too_large",
-        "context_length_exceeded",
-        "payload-too-large",
-      ]) {
+      for (const signal of ["request_payload_too_large", "payload-too-large"]) {
         expect(
           getUpstreamPayloadTooLargeMessage(
             JSON.stringify({ type: "error", status, error: { [field]: signal } })
@@ -86,13 +80,13 @@ describe("getUpstreamPayloadTooLargeMessage", () => {
   it.each([400, 422, 507])("recognizes top-level size codes for status %i", (status) => {
     expect(
       getUpstreamPayloadTooLargeMessage(
-        JSON.stringify({ type: "error", status, code: "context_length_exceeded" })
+        JSON.stringify({ type: "error", status, code: "request_payload_too_large" })
       )
     ).toBe("");
   });
 
   it.each([
-    { code: "context_length_exceeded", error: { message: "Request rejected" } },
+    { code: "request_payload_too_large", error: { message: "Request rejected" } },
     { message: "Payload too large", error: { message: "Request rejected" } },
   ])("checks both error shapes and preserves the nested message: %j", (fields) => {
     expect(
@@ -129,6 +123,20 @@ describe("getUpstreamPayloadTooLargeMessage", () => {
     expect(
       getUpstreamPayloadTooLargeMessage('{"type":"error","status":1e999,"status_code":413}')
     ).not.toBeNull();
+  });
+
+  it.each([
+    { code: "context_length_exceeded" },
+    { error: { code: "context_length_exceeded" } },
+    { error: { type: "context-window-exceeded" } },
+    { error: { message: "Context is too large" } },
+    { message: "Too many tokens" },
+  ])("preserves token/context errors instead of treating them as byte limits: %j", (fields) => {
+    for (const status of [400, 422, 507]) {
+      expect(
+        getUpstreamPayloadTooLargeMessage(JSON.stringify({ type: "error", status, ...fields }))
+      ).toBeNull();
+    }
   });
 
   it("does not override a valid non-size status with status_code", () => {

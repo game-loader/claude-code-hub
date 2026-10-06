@@ -29,6 +29,7 @@ type ServerHarness = {
 
 type ServerJsModule = {
   handleWebSocketConnection: (ws: WebSocket, req: http.IncomingMessage) => Promise<void>;
+  WS_MAX_PAYLOAD_BYTES: number;
 };
 
 let serverModule: ServerJsModule;
@@ -146,7 +147,10 @@ async function startHarness(port: number): Promise<ServerHarness> {
     res.end("not found");
   });
 
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: serverModule.WS_MAX_PAYLOAD_BYTES,
+  });
   server.on("upgrade", (req, socket, head) => {
     if (req.url !== "/v1/responses") {
       socket.destroy();
@@ -411,7 +415,7 @@ describe("server.js WebSocket close-handshake (issue #1150)", () => {
     await client.closeEvent;
   });
 
-  it("accepts response.create bodies up to 4 MiB without a maxPayload teardown", async () => {
+  it("accepts full-context requests above the former 32 MiB limit", async () => {
     if (!harness) throw new Error("harness not initialized");
     harness.setSseHandler((_req, res) => {
       res.statusCode = 200;
@@ -427,10 +431,7 @@ describe("server.js WebSocket close-handshake (issue #1150)", () => {
 
     const client = connectClient(harness.port);
     await client.opened;
-    // 4 MiB of repeated text — comfortably above the prior 1 MiB cap that
-    // caused tungstenite to surface "Connection reset without closing
-    // handshake".
-    const bigInput = "x".repeat(4 * 1024 * 1024);
+    const bigInput = "x".repeat(33 * 1024 * 1024);
     client.ws.send(JSON.stringify({ type: "response.create", model: "gpt-5.5", input: bigInput }));
 
     await waitForMessageCount(client.messages, 1, 3000, "large response was not forwarded");
@@ -439,6 +440,51 @@ describe("server.js WebSocket close-handshake (issue #1150)", () => {
     const close = await client.closeEvent;
     expect(close.code).toBe(1000);
   }, 20000);
+
+  it.each(["text/event-stream", "application/json"])(
+    "forwards large compaction output over %s and keeps the connection reusable",
+    async (contentType) => {
+      if (!harness) throw new Error("harness not initialized");
+      const encryptedContent = "x".repeat(2 * 1024 * 1024);
+      let turns = 0;
+      harness.setSseHandler((_req, res) => {
+        const response = {
+          id: `resp_compaction_${++turns}`,
+          output: [{ type: "compaction", encrypted_content: encryptedContent }],
+        };
+        res.writeHead(200, { "content-type": contentType });
+        res.end(
+          contentType === "text/event-stream"
+            ? `data: ${JSON.stringify({ type: "response.completed", response })}\n\n`
+            : JSON.stringify(response)
+        );
+      });
+      const client = connectClient(harness.port);
+      await client.opened;
+      try {
+        for (let turn = 1; turn <= 2; turn += 1) {
+          client.ws.send(JSON.stringify({ type: "response.create", input: "compact" }));
+          await waitForMessageCount(client.messages, turn, 3000, "compaction output was lost");
+          const message = client.messages[turn - 1] as {
+            type: string;
+            response: { id: string; output: Array<{ encrypted_content: string }> };
+          };
+          expect(message).toMatchObject({
+            type: "response.completed",
+            response: {
+              id: `resp_compaction_${turn}`,
+              output: [{ type: "compaction" }],
+            },
+          });
+          expect(message.response.output[0]?.encrypted_content === encryptedContent).toBe(true);
+          expect(client.ws.readyState).toBe(WebSocket.OPEN);
+        }
+      } finally {
+        client.ws.close(1000, "test_done");
+        await client.closeEvent;
+      }
+    }
+  );
 
   it("processes queued response.create frames sequentially after a terminal event", async () => {
     if (!harness) throw new Error("harness not initialized");

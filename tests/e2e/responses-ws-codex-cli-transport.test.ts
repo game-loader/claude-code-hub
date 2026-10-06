@@ -83,6 +83,9 @@ const model = process.env.CCH_CODEX_E2E_MODEL || "gpt-5.5";
 const responseText = "E2E_TRANSPORT_OK";
 const defaultFeatures = "responses_websockets,responses_websockets_v2";
 const requireFromHere = createRequire(import.meta.url);
+const { RESPONSES_WS_MAX_PAYLOAD_BYTES } = requireFromHere(
+  "../../server-lib/responses-ws-limits.js"
+);
 
 function responseEnvelope(responseId: string, includeOutput: boolean) {
   return {
@@ -192,7 +195,7 @@ async function startProbeServer(): Promise<ProbeServer> {
     res.end("not found");
   });
 
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: RESPONSES_WS_MAX_PAYLOAD_BYTES });
   const sockets = new Set<import("ws").WebSocket>();
   let responseSeq = 0;
   wss.on("connection", (ws, req) => {
@@ -900,7 +903,7 @@ async function startCchEdgeHarness(loadServerModule: ServerJsModuleLoader) {
     res.end("not found");
   });
 
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: RESPONSES_WS_MAX_PAYLOAD_BYTES });
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url || "/", "http://127.0.0.1");
     record({ type: "ws_upgrade", path: url.pathname });
@@ -1090,46 +1093,40 @@ describe("CCH Responses WebSocket edge E2E", () => {
     }
   });
 
-  test("rejects internal bodies that cannot fit in one outbound WebSocket event", async () => {
+  test("forwards compaction bodies above the former outbound limit", async () => {
     const { harness, close } = await startIsolatedCchEdgeHarness();
     try {
+      const encryptedContent = "x".repeat(2 * 1024 * 1024);
       harness.setResponseHandler(({ res, body }) => {
-        if (body.input === "oversized-json") {
+        const response = {
+          id: `resp_${body.input}`,
+          output: [{ type: "compaction", encrypted_content: encryptedContent }],
+        };
+        if (body.input === "large-json") {
           res.statusCode = 200;
           res.setHeader("content-type", "application/json");
-          res.end("x".repeat(1024 * 1024 + 1));
+          res.end(JSON.stringify(response));
           return;
         }
         res.statusCode = 200;
         res.setHeader("content-type", "text/event-stream");
-        res.end(`data: ${"x".repeat(1024 * 1024 + 1)}`);
+        res.end(`data: ${JSON.stringify({ type: "response.completed", response })}\n\n`);
       });
 
-      const jsonClient = connectRawWsClient(harness.port);
-      await jsonClient.opened;
-      sendResponseCreate(jsonClient, { model, input: "oversized-json" });
-      await jsonClient.nextMessage(
-        errorEvent("internal_response_too_large"),
-        3000,
-        "oversized JSON response was not rejected"
-      );
-      expect(await jsonClient.closeEvent).toEqual({
-        code: 1011,
-        reason: "internal_response_too_large",
-      });
-
-      const sseClient = connectRawWsClient(harness.port);
-      await sseClient.opened;
-      sendResponseCreate(sseClient, { model, input: "oversized-sse" });
-      await sseClient.nextMessage(
-        errorEvent("internal_sse_event_too_large"),
-        3000,
-        "oversized unterminated SSE event was not rejected"
-      );
-      expect(await sseClient.closeEvent).toEqual({
-        code: 1011,
-        reason: "internal_sse_event_too_large",
-      });
+      const client = connectRawWsClient(harness.port);
+      await client.opened;
+      for (const input of ["large-json", "large-sse"]) {
+        sendResponseCreate(client, { model, input });
+        const event = (await client.nextMessage(
+          completedResponse(`resp_${input}`),
+          3000,
+          "large compaction response was not forwarded"
+        )) as { response: { output: Array<{ encrypted_content: string }> } };
+        expect(event.response.output[0]?.encrypted_content === encryptedContent).toBe(true);
+        expect(client.ws.readyState).toBe(WebSocket.OPEN);
+      }
+      client.ws.close(1000, "test_done");
+      expect((await client.closeEvent).code).toBe(1000);
     } finally {
       await close();
     }

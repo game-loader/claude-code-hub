@@ -7,8 +7,6 @@ const SIZE_SIGNALS = [
   "request body too large",
   "body too large",
   "content too large",
-  "context length",
-  "context too large",
   "maximum bytes",
   "max bytes",
   "image exceeds",
@@ -42,8 +40,6 @@ export function getUpstreamPayloadTooLargeMessage(payload: string): string | nul
   const error = event.error && typeof event.error === "object" ? event.error : {};
   const errorRecord = error as Record<string, unknown>;
   const message = getJsonString(errorRecord.message) || getJsonString(event.message);
-  if (status === 413) return message;
-
   const description = [
     event.code,
     event.message,
@@ -55,5 +51,11 @@ export function getUpstreamPayloadTooLargeMessage(payload: string): string | nul
     .join(" ")
     .toLowerCase()
     .replace(/[_-]+/g, " ");
+  // Token/context errors need the upstream's original semantics, even when
+  // their text includes "too large". HTTP fallback cannot enlarge a context window.
+  if (/context.*(?:length|window|too large|exceed)|too many tokens|token limit/.test(description)) {
+    return null;
+  }
+  if (status === 413) return message;
   return SIZE_SIGNALS.some((signal) => description.includes(signal)) ? message : null;
 }

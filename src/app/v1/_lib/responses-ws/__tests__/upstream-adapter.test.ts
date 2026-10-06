@@ -562,11 +562,43 @@ describe("tryResponsesWebsocketUpstream", () => {
     expect(body).not.toContain("\0");
   });
 
+  it("preserves compaction output above the former 8 MiB receive limit", async () => {
+    const encryptedContent = "x".repeat(9 * 1024 * 1024);
+    const event = {
+      type: "response.completed",
+      response: {
+        id: "resp_large_compaction",
+        output: [{ type: "compaction", encrypted_content: encryptedContent }],
+      },
+    };
+    server = await startMockServer((socket) => {
+      socket.on("message", () => socket.send(JSON.stringify(event)));
+    });
+    const result = await tryResponsesWebsocketUpstream({
+      provider: codexProvider(),
+      upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+      upstreamHeaders: new Headers(),
+      body: { input: "compact" },
+      sessionId: "large-compaction-session",
+    });
+    expect("response" in result).toBe(true);
+    if (!("response" in result)) throw new Error("large compaction was rejected");
+    const body = await collectSseBody(result.response);
+    const frames = parseSseBody(body);
+    expect(frames).toHaveLength(1);
+    expect(JSON.stringify(JSON.parse(frames[0]!.data)) === JSON.stringify(event)).toBe(true);
+    expect(getResponsesWsContinuationRoute("large-compaction-session", event.response.id)).toEqual({
+      providerId: 1,
+      endpointId: null,
+      baseUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+    });
+  });
+
   it("rejects multiline messages whose SSE framing would exceed the message limit", async () => {
     server = await startMockServer((socket) => {
       socket.on("message", () => {
-        // 原消息约 1.2 MiB，但每行补 `data: ` 后会超过 8 MiB。
-        socket.send("\n".repeat(1_200_000));
+        // The raw 40 MiB message fits; SSE framing would exceed the 256 MiB budget.
+        socket.send("\n".repeat(40 * 1024 * 1024));
       });
     });
 
@@ -695,10 +727,8 @@ describe("tryResponsesWebsocketUpstream", () => {
 
   it.each([
     { status: 413 },
-    { status: 400, code: "context_length_exceeded" },
     { status: 400, error: { code: "request_payload_too_large" } },
     { status: 422, error: { type: "payload-too-large" } },
-    { status: 507, error: { code: "context_length_exceeded" } },
   ])("falls back for a size error without synthesizing a display message: %j", async (event) => {
     server = await startMockServer((socket) => {
       socket.on("message", () => socket.send(JSON.stringify({ type: "error", ...event })));
@@ -716,6 +746,30 @@ describe("tryResponsesWebsocketUpstream", () => {
       cacheableAsUnsupported: false,
     });
   });
+
+  it.each([400, 507])(
+    "preserves an upstream context_length_exceeded event (%i)",
+    async (status) => {
+      const event = {
+        type: "error",
+        status,
+        error: { code: "context_length_exceeded", message: "Maximum context length exceeded" },
+      };
+      server = await startMockServer((socket) => {
+        socket.on("message", () => socket.send(JSON.stringify(event)));
+      });
+      const result = await tryResponsesWebsocketUpstream({
+        provider: codexProvider(),
+        upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+        upstreamHeaders: new Headers(),
+        body: { input: "large context" },
+      });
+      expect("response" in result).toBe(true);
+      if (!("response" in result)) throw new Error("context error was mistaken for a byte limit");
+      const body = await collectSseBody(result.response);
+      expect(parseSseBody(body).map((frame) => JSON.parse(frame.data))).toEqual([event]);
+    }
+  );
 
   it("forgets a retained socket rejected for size and opens a fresh one for the next request", async () => {
     let connections = 0;

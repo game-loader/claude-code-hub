@@ -18,6 +18,11 @@ import { createHash } from "node:crypto";
 import type WebSocketType from "ws";
 import { logger } from "@/lib/logger";
 import type { Provider } from "@/types/provider";
+import {
+  canBufferResponsesWsMessage,
+  RESPONSES_WS_MAX_BUFFERED_BYTES,
+  RESPONSES_WS_MAX_PAYLOAD_BYTES,
+} from "../../../../../server-lib/responses-ws-limits";
 import { hasResponsesWsContinuation } from "./continuation";
 import { RESERVED_INTERNAL_HEADERS } from "./internal-secret";
 import { getUpstreamPayloadTooLargeMessage } from "./payload-too-large";
@@ -79,7 +84,7 @@ const HANDSHAKE_TIMEOUT_MS = 10_000;
 // Hard limit on one upstream message and on queued bytes between the upstream
 // WebSocket and downstream SSE consumer. A message already handed to a waiting
 // pull still counts against the single-message bound.
-const MAX_BUFFERED_QUEUE_BYTES = 8 * 1024 * 1024; // 8 MiB
+const MAX_BUFFERED_QUEUE_BYTES = RESPONSES_WS_MAX_BUFFERED_BYTES;
 // SSE 要为每个物理行补 `data: `。大量换行可让编码后帧远大于原 WS
 // 消息，因此实际交给下游的单帧也必须在分配前受同一硬上限约束。
 const MAX_ENCODED_SSE_EVENT_BYTES = MAX_BUFFERED_QUEUE_BYTES;
@@ -552,7 +557,7 @@ export async function tryResponsesWebsocketUpstream(options: {
       ws = new (WsCtor as unknown as new (url: string, opts?: unknown) => WebSocketType)(wssUrl, {
         headers,
         handshakeTimeout: HANDSHAKE_TIMEOUT_MS,
-        maxPayload: MAX_BUFFERED_QUEUE_BYTES,
+        maxPayload: RESPONSES_WS_MAX_PAYLOAD_BYTES,
       });
     } catch (err) {
       return {
@@ -697,13 +702,13 @@ export async function tryResponsesWebsocketUpstream(options: {
   const onMessage = (data: Buffer | string) => {
     if (socketClosed || requestFinished) return;
     const size = typeof data === "string" ? Buffer.byteLength(data, "utf8") : data.byteLength;
-    if (size > MAX_BUFFERED_QUEUE_BYTES) {
+    if (size > RESPONSES_WS_MAX_PAYLOAD_BYTES) {
       logger.warn("[ResponsesWsAdapter] oversized upstream message, terminating WS", {
         attemptedSize: size,
       });
       const failure = {
         code: "upstream_ws_message_too_large",
-        message: `upstream payload exceeded ${MAX_BUFFERED_QUEUE_BYTES} bytes`,
+        message: `upstream payload exceeded ${RESPONSES_WS_MAX_PAYLOAD_BYTES} bytes`,
       };
       if (!firstEventSeen) {
         finishOpen({
@@ -753,7 +758,7 @@ export async function tryResponsesWebsocketUpstream(options: {
     const queuedMessages = queuedMessageCount();
     if (
       queuedMessages >= MAX_BUFFERED_QUEUE_MESSAGES ||
-      queuedBytes + size > MAX_BUFFERED_QUEUE_BYTES
+      !canBufferResponsesWsMessage(size, queuedBytes)
     ) {
       logger.warn("[ResponsesWsAdapter] upstream queue overflow, terminating WS", {
         queuedBytes,

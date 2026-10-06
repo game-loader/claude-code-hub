@@ -33,6 +33,9 @@ type ServerModule = {
 };
 
 const serverModule: ServerModule = requireFromHere("../../server.js");
+const { RESPONSES_WS_MAX_PAYLOAD_BYTES } = requireFromHere(
+  "../../server-lib/responses-ws-limits.js"
+);
 
 function createClientRequest(writeResult: boolean, events: string[]): http.ClientRequest {
   const request: http.ClientRequest = Object.create(http.ClientRequest.prototype);
@@ -348,14 +351,35 @@ describe("server response write backpressure", () => {
     const bridge = await startSseBridge(vi.fn());
     const destroyResponse = vi.spyOn(bridge.response, "destroy");
     const delta = "x".repeat(600 * 1024);
-    const event = `data: ${JSON.stringify({ type: "response.output_text.delta", delta })}\n\n`;
+    const payload = JSON.stringify({ type: "response.output_text.delta", delta });
+    const event = `data: ${payload}\n\n`;
+    const byteLength = Buffer.byteLength;
+    // Exercise the real queue accounting with maximum-sized messages without
+    // allocating hundreds of MiB of duplicate test strings.
+    vi.spyOn(Buffer, "byteLength").mockImplementation((value, encoding) =>
+      value === payload ? RESPONSES_WS_MAX_PAYLOAD_BYTES : byteLength(value, encoding)
+    );
 
-    // 每个事件都低于单事件上限，但未确认发送的累计字节超过连接预算。
     bridge.response.emit("data", event + event);
+    expect(bridge.ws.close).not.toHaveBeenCalled();
+    bridge.response.emit("data", event);
 
     expect(bridge.events).toContain("destroy");
     expect(destroyResponse).toHaveBeenCalledOnce();
     expect(bridge.ws.close.mock.calls).toEqual([[1011, "outbound_backpressure"]]);
+  });
+
+  it("rejects a single oversized message even when the outbound queue is empty", async () => {
+    const bridge = await startSseBridge(vi.fn());
+    const payload = JSON.stringify({ type: "response.output_text.delta", delta: "test" });
+    const byteLength = Buffer.byteLength;
+    vi.spyOn(Buffer, "byteLength").mockImplementation((value, encoding) =>
+      value === payload ? RESPONSES_WS_MAX_PAYLOAD_BYTES + 1 : byteLength(value, encoding)
+    );
+    bridge.response.emit("data", `data: ${payload}\n\n`);
+    expect(bridge.ws.send).not.toHaveBeenCalled();
+    expect(bridge.events).toContain("destroy");
+    expect(bridge.ws.close.mock.calls).toEqual([[1011, "outbound_message_too_large"]]);
   });
 
   it("sends a fatal terminal frame before initiating close", async () => {

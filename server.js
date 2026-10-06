@@ -26,6 +26,11 @@ const http = require("node:http");
 const { randomUUID } = require("node:crypto");
 const { parse } = require("node:url");
 const { normalizeResponsesWsRecoveryEvent } = require("./server-lib/responses-ws-recovery");
+const {
+  RESPONSES_WS_MAX_PAYLOAD_BYTES,
+  RESPONSES_WS_MAX_BUFFERED_BYTES,
+  canBufferResponsesWsMessage,
+} = require("./server-lib/responses-ws-limits");
 
 function isNextDevMode(nodeEnv) {
   return nodeEnv !== "production";
@@ -58,22 +63,20 @@ const RESERVED_INTERNAL_HEADER_PREFIX = "x-cch-";
 // Per-WebSocket-connection guardrails: cap the queue depth and total queued
 // bytes to make a misbehaving / malicious client a bounded-memory event.
 const MAX_PENDING_FRAMES = 64;
-const MAX_PENDING_BYTES = 64 * 1024 * 1024; // 64 MiB across all queued frames
-const MAX_PENDING_OUTBOUND_BYTES = 1024 * 1024; // 1 MiB per client WebSocket
+const MAX_PENDING_BYTES = RESPONSES_WS_MAX_BUFFERED_BYTES;
+const MAX_PENDING_OUTBOUND_BYTES = RESPONSES_WS_MAX_BUFFERED_BYTES;
 // Internal HTTP responses ultimately become one outbound WS frame per event.
 // Bound aggregation at the same layer instead of first materializing a body
 // that safeSend can never accept.
-const MAX_INTERNAL_RESPONSE_BODY_BYTES = MAX_PENDING_OUTBOUND_BYTES;
+const MAX_INTERNAL_RESPONSE_BODY_BYTES = RESPONSES_WS_MAX_PAYLOAD_BYTES;
+// SSE framing adds bytes around the JSON payload; safeSend separately checks
+// the actual UTF-8 WebSocket message against the single-message limit.
 const MAX_INTERNAL_SSE_EVENT_CHARACTERS = MAX_PENDING_OUTBOUND_BYTES;
 const REQUEST_BODY_DRAIN_TIMEOUT_MS = 30_000;
 const OUTBOUND_SEND_TIMEOUT_MS = 30_000;
 
-// Maximum payload size for any single inbound WS frame. The default `ws`
-// limit is 100 MiB. We pick 32 MiB to accommodate Codex requests that ship
-// large conversation history alongside the prompt — a tighter cap caused the
-// `ws` library to socket.destroy() (TCP RST) without sending a close frame,
-// surfacing on the client as "Connection reset without closing handshake".
-const WS_MAX_PAYLOAD_BYTES = 32 * 1024 * 1024; // 32 MiB per frame
+// Apply the same message ceiling on both sides of the Responses WS bridge.
+const WS_MAX_PAYLOAD_BYTES = RESPONSES_WS_MAX_PAYLOAD_BYTES;
 
 const TERMINAL_EVENT_TYPES = new Set([
   "response.completed",
@@ -209,9 +212,12 @@ function safeSend(ws, data, options = {}) {
     options.response.pause();
     state.pressuredResponses.add(options.response);
   }
-  if (!state.active || state.pendingBytes + bytes > MAX_PENDING_OUTBOUND_BYTES) {
+  if (!state.active || !canBufferResponsesWsMessage(bytes, state.pendingBytes)) {
     failOutboundSends(ws, state, {
-      reason: "outbound_backpressure",
+      reason:
+        bytes > RESPONSES_WS_MAX_PAYLOAD_BYTES
+          ? "outbound_message_too_large"
+          : "outbound_backpressure",
       onFailure: options.onFailure,
     });
     return false;

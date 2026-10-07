@@ -126,9 +126,81 @@ async function startSseBridge(send: WebSocketLike["send"]) {
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 describe("server response write backpressure", () => {
+  it.each(["true", "false"])(
+    "applies plaintext collaboration compatibility only when enabled (%s)",
+    async (setting) => {
+      vi.stubEnv("CCH_CODEX_PLAINTEXT_AGENT_MESSAGES", setting);
+      const events: string[] = [];
+      const request = createClientRequest(true, events);
+      const write = vi.spyOn(request, "write");
+      let respond: ((response: http.IncomingMessage) => void) | undefined;
+      vi.spyOn(http, "request").mockImplementation((_options, callback) => {
+        if (callback) respond = callback;
+        return request;
+      });
+      const input = requestInput();
+      const body = {
+        ...input.body,
+        tools: [
+          {
+            type: "namespace",
+            name: "collaboration",
+            tools: [
+              {
+                type: "function",
+                name: "spawn_agent",
+                parameters: { properties: { message: { type: "string", encrypted: true } } },
+              },
+            ],
+          },
+        ],
+      };
+      const forwarding = serverModule.forwardToInternalHttp(
+        input.ws,
+        input.request,
+        body,
+        "compat-session"
+      );
+      const outgoing = JSON.parse(Buffer.from(write.mock.calls[0]![0] as Buffer).toString());
+      expect(outgoing.tools[0].tools[0].parameters.properties.message.encrypted).toBe(
+        setting === "true" ? undefined : true
+      );
+      expect(outgoing.tools[0].name).toBe(
+        setting === "true" ? "cch_collaboration_plaintext" : "collaboration"
+      );
+      const response = createIncomingResponse();
+      respond?.(response);
+      const item = {
+        type: "function_call",
+        namespace: setting === "true" ? "cch_collaboration_plaintext" : "collaboration",
+        name: "spawn_agent",
+        arguments: JSON.stringify({ task_name: "probe", message: "Read README.md" }),
+      };
+      response.emit(
+        "data",
+        `data: ${JSON.stringify({ type: "response.output_item.done", item })}\n\n`
+      );
+      response.emit(
+        "data",
+        `data: ${JSON.stringify({ type: "response.completed", response: { output: [item] } })}\n\n`
+      );
+      response.emit("end");
+      await forwarding;
+      const sent = input.ws.send.mock.calls.map(([payload]) => JSON.parse(payload));
+      expect(sent[0].item.namespace).toBe("collaboration");
+      expect(sent[0].item.encrypted_function_args).toEqual(setting === "true" ? [] : undefined);
+      expect(sent[1].response.output[0].encrypted_function_args).toEqual(
+        setting === "true" ? [] : undefined
+      );
+      expect(input.ws.close).not.toHaveBeenCalled();
+      response.destroy();
+    }
+  );
+
   it("uses the explicit per-worker loopback target instead of the shared public port", async () => {
     const events: string[] = [];
     const request = createClientRequest(true, events);

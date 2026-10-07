@@ -27,6 +27,10 @@ const { randomUUID } = require("node:crypto");
 const { parse } = require("node:url");
 const { normalizeResponsesWsRecoveryEvent } = require("./server-lib/responses-ws-recovery");
 const {
+  prepareCodexPlaintextAgentTools,
+  normalizeCodexPlaintextAgentEvent,
+} = require("./server-lib/codex-agent-message-compat");
+const {
   RESPONSES_WS_MAX_PAYLOAD_BYTES,
   RESPONSES_WS_MAX_BUFFERED_BYTES,
   canBufferResponsesWsMessage,
@@ -573,8 +577,16 @@ async function forwardToInternalHttp(
         };
   const continuation =
     typeof body.previous_response_id === "string" && body.previous_response_id.length > 0;
+  const plaintextAgentMessages = process.env.CCH_CODEX_PLAINTEXT_AGENT_MESSAGES === "true";
   const sendToClient = (clientSocket, event, options) =>
-    safeSend(clientSocket, normalizeResponsesWsRecoveryEvent(event, continuation), options);
+    safeSend(
+      clientSocket,
+      normalizeResponsesWsRecoveryEvent(
+        plaintextAgentMessages ? normalizeCodexPlaintextAgentEvent(event) : event,
+        continuation
+      ),
+      options
+    );
   const internalHeaders = {};
   for (const [k, v] of Object.entries(originalReq.headers)) {
     const lower = k.toLowerCase();
@@ -627,6 +639,7 @@ async function forwardToInternalHttp(
   let bodyForHttp = { ...body, stream: true };
   body = null;
   delete bodyForHttp.background;
+  if (plaintextAgentMessages) prepareCodexPlaintextAgentTools(bodyForHttp);
 
   let payload = Buffer.from(JSON.stringify(bodyForHttp), "utf8");
   bodyForHttp = null;

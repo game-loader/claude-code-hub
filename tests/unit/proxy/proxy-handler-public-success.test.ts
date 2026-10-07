@@ -1,5 +1,5 @@
 import { Context } from "hono";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProxySession } from "@/app/v1/_lib/proxy/session";
 import type { FakeStreamingWhitelistEntry } from "@/types/system-config";
 
@@ -101,6 +101,7 @@ function createContext(pathname: string, body: Record<string, unknown>): Context
 }
 
 describe("handleProxyRequest public success behavior", () => {
+  afterEach(() => vi.unstubAllEnvs());
   beforeEach(() => {
     observedSession = null;
     boundary.fakeStreamingCalls = 0;
@@ -197,6 +198,68 @@ describe("handleProxyRequest public success behavior", () => {
       output: [{ type: "message", content: [] }],
       tools: [],
     });
+  });
+
+  it.each([false, true])("supports direct HTTP agent messages with stream=%s", async (stream) => {
+    vi.stubEnv("CCH_CODEX_PLAINTEXT_AGENT_MESSAGES", "true");
+    boundary.send.mockImplementation(async (session) => {
+      expect(session.request.message.tools).toMatchObject([
+        { name: "cch_collaboration_plaintext" },
+      ]);
+      const wire = JSON.parse(new TextDecoder().decode(session.request.buffer));
+      expect(wire.tools[0].tools[0].parameters.properties.message).toEqual({ type: "string" });
+      const payload = {
+        id: "resp_agent",
+        object: "response",
+        output: [
+          {
+            type: "function_call",
+            namespace: "cch_collaboration_plaintext",
+            name: "spawn_agent",
+            arguments: JSON.stringify({ message: "Read README.md" }),
+          },
+        ],
+      };
+      return stream
+        ? new Response(
+            `data: ${JSON.stringify({ type: "response.completed", response: payload })}\n\n`,
+            {
+              headers: { "content-type": "text/event-stream" },
+            }
+          )
+        : Response.json(payload);
+    });
+    const response = await handleProxyRequest(
+      createContext("/v1/responses", {
+        model: "gpt-test",
+        stream,
+        input: [],
+        tools: [
+          {
+            type: "namespace",
+            name: "collaboration",
+            tools: [
+              {
+                type: "function",
+                name: "spawn_agent",
+                parameters: {
+                  type: "object",
+                  properties: { message: { type: "string", encrypted: true } },
+                },
+              },
+            ],
+          },
+        ],
+      })
+    );
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    const payload = stream ? JSON.parse(text.trim().slice(6)).response : JSON.parse(text);
+    expect(payload.output[0]).toMatchObject({
+      namespace: "collaboration",
+      encrypted_function_args: [],
+    });
+    expect(boundary.send).toHaveBeenCalledOnce();
   });
 
   it("routes remote compaction v2 through the v1 compact management policy", async () => {

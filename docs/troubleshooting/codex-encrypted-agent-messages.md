@@ -13,16 +13,17 @@ decryption keys.
 
 ## Optional plaintext compatibility
 
-For clients connected to CCH's `/v1/responses` **WebSocket** endpoint, set this
+For clients connected to CCH's `/v1/responses` HTTP or WebSocket endpoint, set this
 environment variable on the CCH process and restart it:
 
 ```dotenv
 CCH_CODEX_PLAINTEXT_AGENT_MESSAGES=true
 ```
 
-The default is `false`. This option applies at the client WebSocket bridge,
-whether CCH subsequently uses upstream WebSocket or HTTP SSE. It does not apply
-to clients sending HTTP requests directly to CCH.
+The default is `false`. This option applies to HTTP JSON responses, HTTP SSE
+streams, and the client WebSocket bridge, whether CCH subsequently uses upstream
+WebSocket or HTTP. Both request schemas and response function calls are handled
+in the shared HTTP proxy pipeline. Other endpoints are unchanged.
 
 When enabled, CCH removes the encrypted annotation from the three collaboration
 tools' message schemas, including Responses Lite `additional_tools` items. For
@@ -45,9 +46,9 @@ responsible for supporting them.
 
 ## Validation
 
-The unit suite checks both tool-advertisement formats, response item and completed
-response handling, the opt-in boundary, and preservation of ciphertext and
-unrelated encrypted fields:
+The unit suite checks both tool-advertisement formats, HTTP JSON and fragmented
+SSE responses, response item and completed response handling, the opt-in boundary,
+stream cancellation, and preservation of ciphertext and unrelated encrypted fields:
 
 ```bash
 bunx vitest run --config tests/configs/codex-agent-message-compat.config.mts --coverage
@@ -59,6 +60,10 @@ to `input_text`. A live Codex 0.159.2 probe through the patched bridge and the
 configured upstream completed spawn, wait, and child-result delivery with the
 requested fixed reply and no encrypted child task parts. An encrypted-message
 control on that same configured entry point failed to interpret the task.
+Another live probe forced the CLI to use HTTP (`supports_websockets=false`)
+through the shared compatibility adapter and the configured HTTP upstream. It
+completed child-result delivery in four requests, with plaintext child task
+parts and no encrypted child task parts.
 Support and latency of other upstreams still require a live test.
 
 Implementation reference:

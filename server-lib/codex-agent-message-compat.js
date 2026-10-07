@@ -47,7 +47,10 @@ function prepareCodexPlaintextAgentTools(body) {
       }
       // Some Codex models reserve collaboration.* and reject modified schemas.
       // Use a wire-only alias, then restore it before the client dispatches calls.
-      if (compatibleNamespace) namespace.name = UPSTREAM_NAMESPACE;
+      if (compatibleNamespace) {
+        namespace.name = UPSTREAM_NAMESPACE;
+        changed += 1;
+      }
     }
   }
   if (Array.isArray(body.input)) {
@@ -59,6 +62,7 @@ function prepareCodexPlaintextAgentTools(body) {
         COLLABORATION_TOOLS.has(item.name)
       ) {
         item.namespace = UPSTREAM_NAMESPACE;
+        changed += 1;
       }
     }
   }
@@ -66,6 +70,7 @@ function prepareCodexPlaintextAgentTools(body) {
 }
 
 function markPlaintextCall(item) {
+  let changed = false;
   if (
     isRecord(item) &&
     item.type === "function_call" &&
@@ -73,6 +78,7 @@ function markPlaintextCall(item) {
     COLLABORATION_TOOLS.has(item.name)
   ) {
     item.namespace = "collaboration";
+    changed = true;
   }
   if (
     !isRecord(item) ||
@@ -81,30 +87,48 @@ function markPlaintextCall(item) {
     !MESSAGE_TOOLS.has(item.name) ||
     item.encrypted_function_args != null
   )
-    return;
+    return changed;
   let args;
   try {
     args = JSON.parse(item.arguments);
   } catch {
-    return;
+    return changed;
   }
-  if (!isRecord(args) || typeof args.message !== "string") return;
+  if (!isRecord(args) || typeof args.message !== "string") return changed;
   // Never relabel an opaque envelope as plaintext. Existing encrypted tasks
   // still require an upstream capable of interpreting their payloads.
-  if (args.message.trim().startsWith("gAAA")) return;
+  if (args.message.trim().startsWith("gAAA")) return changed;
   // Codex distinguishes an explicit empty list from a missing field. Only []
   // makes collaboration calls use its DirectPlaintextMessage dispatch path.
   item.encrypted_function_args = [];
+  return true;
+}
+
+function normalizeCodexPlaintextAgentPayload(event) {
+  if (!isRecord(event)) return false;
+  if (event.type === "response.output_item.added" || event.type === "response.output_item.done") {
+    return markPlaintextCall(event.item);
+  }
+  const response =
+    event.object === "response"
+      ? event
+      : typeof event.type === "string" && event.type.startsWith("response.")
+        ? event.response
+        : null;
+  let changed = false;
+  if (isRecord(response) && Array.isArray(response.output)) {
+    for (const item of response.output) changed = markPlaintextCall(item) || changed;
+  }
+  return changed;
 }
 
 function normalizeCodexPlaintextAgentEvent(event) {
-  if (!isRecord(event)) return event;
-  if (event.type === "response.output_item.added" || event.type === "response.output_item.done") {
-    markPlaintextCall(event.item);
-  } else if (event.type === "response.completed" && Array.isArray(event.response?.output)) {
-    for (const item of event.response.output) markPlaintextCall(item);
-  }
+  normalizeCodexPlaintextAgentPayload(event);
   return event;
 }
 
-module.exports = { prepareCodexPlaintextAgentTools, normalizeCodexPlaintextAgentEvent };
+module.exports = {
+  prepareCodexPlaintextAgentTools,
+  normalizeCodexPlaintextAgentEvent,
+  normalizeCodexPlaintextAgentPayload,
+};

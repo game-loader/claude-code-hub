@@ -43,7 +43,7 @@ describe("Codex plaintext agent-message compatibility", () => {
         location === "tools"
           ? { tools: [group], input: [opaque] }
           : { input: [opaque, { type: "additional_tools", tools: [group] }] };
-      expect(prepareCodexPlaintextAgentTools(body)).toBe(3);
+      expect(prepareCodexPlaintextAgentTools(body)).toBe(4);
       expect(group.name).toBe("cch_collaboration_plaintext");
       for (const tool of group.tools) {
         expect(tool.parameters.properties.message.encrypted).toBeUndefined();
@@ -190,6 +190,13 @@ describe("Codex plaintext agent-message compatibility", () => {
         ],
       },
     };
+    const original = structuredClone(event);
+    normalizeCodexPlaintextAgentEvent(event);
+    expect(event).toEqual(original);
+  });
+
+  it("does not rewrite nested response fields in unrelated events", () => {
+    const event = { type: "custom", response: { output: [call()] } };
     const original = structuredClone(event);
     normalizeCodexPlaintextAgentEvent(event);
     expect(event).toEqual(original);

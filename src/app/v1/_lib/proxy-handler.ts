@@ -9,6 +9,10 @@ import { withRequestMemoryLifetime } from "@/lib/memory/request-lifetime";
 import { ProxyStatusTracker } from "@/lib/proxy-status-tracker";
 import { SessionManager } from "@/lib/session-manager";
 import { SessionTracker } from "@/lib/session-tracker";
+import {
+  normalizeCodexAgentMessageResponse,
+  prepareCodexAgentMessageRequest,
+} from "./proxy/codex-agent-message-compat";
 import { ProxyErrorHandler } from "./proxy/error-handler";
 import { attachSessionIdToErrorResponse } from "./proxy/error-session-id";
 import { ProxyError } from "./proxy/errors";
@@ -23,7 +27,13 @@ import { ProxyResponses } from "./proxy/responses";
 import { ProxySession } from "./proxy/session";
 
 export async function handleProxyRequest(c: Context): Promise<Response> {
-  return withRequestMemoryLifetime(() => handleOwnedProxyRequest(c));
+  return withRequestMemoryLifetime(async () => {
+    const response = await handleOwnedProxyRequest(c);
+    return process.env.CCH_CODEX_PLAINTEXT_AGENT_MESSAGES === "true" &&
+      new URL(c.req.url).pathname === "/v1/responses"
+      ? normalizeCodexAgentMessageResponse(response)
+      : response;
+  });
 }
 
 async function handleOwnedProxyRequest(c: Context): Promise<Response> {
@@ -123,6 +133,7 @@ async function handleOwnedProxyRequest(c: Context): Promise<Response> {
     // Response API input rectifier: normalize non-array input before guard pipeline
     if (session.originalFormat === "response") {
       await normalizeResponseInput(session);
+      await prepareCodexAgentMessageRequest(session);
     }
 
     // Build guard pipeline from session endpoint policy

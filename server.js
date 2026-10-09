@@ -648,11 +648,35 @@ async function forwardToInternalHttp(
   await new Promise((resolve) => {
     let cleanupRequestBody = () => {};
     let turnFinished = false;
-    const forceSettleTurn = () => {
-      if (turnFinished) return false;
-      turnFinished = true;
-      cleanupRequestBody();
+    let turnResolved = false;
+    let req = null;
+    let internalResponse = null;
+    const resolveTurn = () => {
+      if (turnResolved) return false;
+      turnResolved = true;
       resolve();
+      return true;
+    };
+    const destroyInternalTransports = () => {
+      for (const transport of [internalResponse, req]) {
+        try {
+          if (transport && !transport.destroyed) transport.destroy();
+        } catch (err) {
+          log("warn", "ws_internal_transport_cleanup_failed", {
+            error: String(err && err.message ? err.message : err),
+          });
+        }
+      }
+    };
+    const forceSettleTurn = () => {
+      // A fatal send can have ended transport ownership while its callback is
+      // still pending. Client close must resolve that wait before invalidating
+      // the callback queue; turnFinished alone does not mean Promise settled.
+      if (turnResolved) return false;
+      turnFinished = true;
+      resolveTurn();
+      cleanupRequestBody();
+      destroyInternalTransports();
       return true;
     };
     const tunnelTarget =
@@ -661,7 +685,7 @@ async function forwardToInternalHttp(
       Number.isInteger(internalHttpTarget.port)
         ? internalHttpTarget
         : { hostname: INTERNAL_TUNNEL_HOST, port };
-    const req = http.request(
+    req = http.request(
       {
         method: "POST",
         hostname: tunnelTarget.hostname,
@@ -670,19 +694,27 @@ async function forwardToInternalHttp(
         headers: internalHeaders,
       },
       (res) => {
+        internalResponse = res;
+        if (turnFinished) {
+          destroyInternalTransports();
+          return;
+        }
         const contentType = (res.headers["content-type"] || "").toLowerCase();
         const isSse = contentType.includes("text/event-stream");
         let responseSettled = false;
         let responseBodyEnded = false;
+        let responseTerminalReceived = false;
         let terminalSendAcknowledged = false;
         let terminalFailureQueued = false;
         const settleResponse = () => {
           if (responseSettled) return false;
-          if (!responseBodyEnded || !terminalSendAcknowledged) return false;
+          if ((!responseBodyEnded && !responseTerminalReceived) || !terminalSendAcknowledged)
+            return false;
           responseSettled = true;
           turnFinished = true;
           cleanupRequestBody();
-          resolve();
+          destroyInternalTransports();
+          resolveTurn();
           return true;
         };
         const acknowledgeTerminalSend = () => {
@@ -781,7 +813,7 @@ async function forwardToInternalHttp(
             }
           });
           res.on("error", (err) => {
-            if (responseSettled || terminalFailureQueued) return;
+            if (turnFinished || responseSettled || terminalFailureQueued) return;
             sendFatalError(
               "internal_response_error",
               String(err && err.message ? err.message : err),
@@ -789,7 +821,7 @@ async function forwardToInternalHttp(
             );
           });
           res.on("close", () => {
-            if (responseSettled || terminalFailureQueued) return;
+            if (turnFinished || responseSettled || terminalFailureQueued) return;
             if (responseBodyEnded || res.complete) {
               responseBodyEnded = true;
               settleResponse();
@@ -813,7 +845,7 @@ async function forwardToInternalHttp(
         let terminalEventType = null;
         const EVENT_DELIMITER = /\r?\n\r?\n/g;
         const failIfUnsettled = (code, message, closeReason) => {
-          if (responseSettled) return;
+          if (turnFinished || responseSettled || terminalFailureQueued) return;
           if (sawTerminal) {
             // A terminal protocol event is authoritative. Once the internal
             // transport closes, wait only for its WS send acknowledgement;
@@ -854,12 +886,13 @@ async function forwardToInternalHttp(
                 // Some upstreams close SSE with [DONE] without a preceding
                 // response.completed. Synthesize one so the client sees a
                 // clean terminal event.
+                sawTerminal = true;
+                responseTerminalReceived = true;
                 sendToClient(ws, { type: "response.completed", response: null }, {
                   response: res,
                   onSuccess: acknowledgeTerminalSend,
                   onFailure: settleAndClose,
                 });
-                sawTerminal = true;
               }
               return;
             }
@@ -876,14 +909,19 @@ async function forwardToInternalHttp(
             }
             const isTerminalEvent =
               event && typeof event.type === "string" && TERMINAL_EVENT_TYPES.has(event.type);
+            if (isTerminalEvent) {
+              // The protocol terminal is authoritative even when HTTP never
+              // emits EOF. Keep WS send ordering, then dispose the tunnel.
+              sawTerminal = true;
+              responseTerminalReceived = true;
+              terminalEventType = event.type;
+            }
             sendToClient(ws, event, {
               response: res,
               onSuccess: isTerminalEvent ? acknowledgeTerminalSend : undefined,
               onFailure: settleAndClose,
             });
             if (isTerminalEvent) {
-              sawTerminal = true;
-              terminalEventType = event.type;
               log("info", "ws_terminal_event_sent", { type: event.type, source: "sse" });
             }
         };
@@ -980,12 +1018,13 @@ async function forwardToInternalHttp(
       }
       turnFinished = true;
       cleanupRequestBody();
+      destroyInternalTransports();
       let finished = false;
       const finish = () => {
         if (finished) return;
         finished = true;
         initiateClose(1011, "internal_request_error");
-        resolve();
+        resolveTurn();
       };
       const sent = sendToClient(
         ws,
@@ -1031,9 +1070,10 @@ async function forwardToInternalHttp(
       clearRequestBodyListeners();
       if (!turnFinished) {
         turnFinished = true;
+        destroyInternalTransports();
         const finish = () => {
           initiateClose(1011, "internal_request_body_closed");
-          resolve();
+          resolveTurn();
         };
         const sent = sendToClient(
           ws,
@@ -1049,17 +1089,17 @@ async function forwardToInternalHttp(
         if (!sent) finish();
         return;
       }
-      resolve();
+      resolveTurn();
     };
     const expireRequestBody = () => {
       if (requestBodyFinished) return;
       requestBodyFinished = true;
       clearRequestBodyListeners();
       turnFinished = true;
-      if (!req.destroyed) req.destroy();
+      destroyInternalTransports();
       const finish = () => {
         initiateClose(1011, "internal_request_drain_timeout");
-        resolve();
+        resolveTurn();
       };
       const sent = sendToClient(
         ws,

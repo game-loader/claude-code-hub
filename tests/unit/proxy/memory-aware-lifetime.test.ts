@@ -179,7 +179,7 @@ describe("请求内存确定性回收", () => {
     expect(stats.drainingLabels["stuck-redis"]).toBeUndefined();
   });
 
-  it("仍在推进的后台消费者刷新宽限；响应未结束时不计时", async () => {
+  it("仍在推进的响应和后台消费者刷新各自的空闲宽限", async () => {
     vi.useFakeTimers();
     const governor = new MemoryGovernor({
       limit: 100,
@@ -188,17 +188,27 @@ describe("请求内存确定性回收", () => {
       enabled: true,
     });
     let retention!: ReturnType<typeof retainCurrentRequestMemory>;
-    const body = new ReadableStream<Uint8Array>();
+    let source!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        source = controller;
+      },
+    });
     const response = await withRequestMemoryLifetime(async () => {
       attachRequestMemory(governor.tryLease(100)!);
       retention = retainCurrentRequestMemory("detached-drain");
       return new Response(body);
     });
-    // 响应仍在流式传输：无论多久都不强制归还。
-    await vi.advanceTimersByTimeAsync(600_000);
+    // 总时长超过响应空闲上限，但持续读取数据不会结束根所有者。
+    const reader = response.body!.getReader();
+    for (let i = 0; i < 8; i++) {
+      await vi.advanceTimersByTimeAsync(100_000);
+      source.enqueue(new Uint8Array([1]));
+      await reader.read();
+    }
     expect(governor.snapshot().usedBytes).toBe(100);
 
-    await response.body!.cancel();
+    await reader.cancel();
     for (let i = 0; i < 4; i++) {
       await vi.advanceTimersByTimeAsync(100_000);
       retention.touch();

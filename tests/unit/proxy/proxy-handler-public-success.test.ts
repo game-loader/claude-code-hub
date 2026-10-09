@@ -1,7 +1,9 @@
 import { Context } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProxySession } from "@/app/v1/_lib/proxy/session";
+import { attachRequestMemory, getRequestMemoryLifetimeStats } from "@/lib/memory/request-lifetime";
 import type { FakeStreamingWhitelistEntry } from "@/types/system-config";
+import { MemoryGovernor } from "../../../server-lib/memory-governor";
 
 type ProxySettingsFixture = {
   readonly enableHighConcurrencyMode: boolean;
@@ -91,11 +93,16 @@ const defaultSettings: ProxySettingsFixture = {
   fakeStreamingWhitelist: [],
 };
 
-function createContext(pathname: string, body: Record<string, unknown>): Context {
+function createContext(
+  pathname: string,
+  body: Record<string, unknown>,
+  signal?: AbortSignal
+): Context {
   const request = new Request(`http://localhost${pathname}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
   return new Context(request);
 }
@@ -135,6 +142,30 @@ describe("handleProxyRequest public success behavior", () => {
     expect(response.headers.get("content-type")).toContain("application/json");
     expect(await response.json()).toEqual({ id: "msg_1", type: "message", content: [] });
     expect(boundary.send).toHaveBeenCalledOnce();
+  });
+
+  it("releases an unconsumed public error response when the client aborts", async () => {
+    const memory = new MemoryGovernor({ limit: 100, remote: false, monitor: false, enabled: true });
+    const before = getRequestMemoryLifetimeStats();
+    const client = new AbortController();
+    boundary.send.mockImplementation(async () => {
+      attachRequestMemory(memory.tryLease(100)!);
+      return Response.json({ error: { message: "Request aborted by client" } }, { status: 499 });
+    });
+    const response = await handleProxyRequest(
+      createContext(
+        "/v1/responses",
+        {
+          model: "local-test",
+          input: [],
+        },
+        client.signal
+      )
+    );
+    client.abort(new Error("client disconnected"));
+    await vi.waitFor(() => expect(memory.snapshot().usedBytes).toBe(0));
+    expect(getRequestMemoryLifetimeStats().active).toBe(before.active);
+    await expect(response.text()).rejects.toThrow("client disconnected");
   });
 
   it("returns synthesized SSE when the request is fake-stream eligible", async () => {

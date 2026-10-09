@@ -27,13 +27,16 @@ import { ProxyResponses } from "./proxy/responses";
 import { ProxySession } from "./proxy/session";
 
 export async function handleProxyRequest(c: Context): Promise<Response> {
-  return withRequestMemoryLifetime(async () => {
-    const response = await handleOwnedProxyRequest(c);
-    return process.env.CCH_CODEX_PLAINTEXT_AGENT_MESSAGES === "true" &&
-      new URL(c.req.url).pathname === "/v1/responses"
-      ? normalizeCodexAgentMessageResponse(response)
-      : response;
-  });
+  return withRequestMemoryLifetime(
+    async () => {
+      const response = await handleOwnedProxyRequest(c);
+      return process.env.CCH_CODEX_PLAINTEXT_AGENT_MESSAGES === "true" &&
+        new URL(c.req.url).pathname === "/v1/responses"
+        ? normalizeCodexAgentMessageResponse(response)
+        : response;
+    },
+    { signal: c.req?.raw?.signal }
+  );
 }
 
 async function handleOwnedProxyRequest(c: Context): Promise<Response> {

@@ -316,7 +316,7 @@ describe("server response write backpressure", () => {
     await forwarding;
 
     request.emit("drain");
-    expect(events).toEqual(["write"]);
+    expect(events).toEqual(["write", "destroy"]);
   });
 
   it("terminates a request body when drain never arrives", async () => {
@@ -607,5 +607,216 @@ describe("server response write backpressure", () => {
     expect(requestSpy).not.toHaveBeenCalled();
     callbacks.shift()?.();
     expect(ws.close).toHaveBeenCalledWith(1003, "binary_not_supported");
+  });
+
+  it.each(["response.completed", "response.failed", "response.incomplete", "error", "[DONE]"])(
+    "settles %s after acknowledgement without waiting for internal EOF",
+    async (type) => {
+      let callback: ((error?: Error) => void) | undefined;
+      const bridge = await startSseBridge((_payload, done) => {
+        callback = done;
+      });
+      const destroy = vi.spyOn(bridge.response, "destroy");
+      const payload = type === "[DONE]" ? type : JSON.stringify({ type, response: { id: "r1" } });
+      bridge.response.emit("data", `data: ${payload}\n\n`);
+      expect(bridge.request.destroyed).toBe(false);
+      callback?.();
+      expect(bridge.request.destroyed).toBe(true);
+      expect(destroy).toHaveBeenCalledOnce();
+      expect(bridge.ws.close).not.toHaveBeenCalled();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      // The persistent WS session accepts a subsequent turn, but the old
+      // HTTP response/request must not remain alive on that connection.
+      bridge.ws.emit("message", Buffer.from('{"type":"response.create","input":"next"}'), false);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(http.request).toHaveBeenCalledTimes(2);
+      bridge.ws.emit("close");
+    }
+  );
+
+  it.each([400, 413, 429, 499, 502])(
+    "destroys both transports after JSON HTTP %s",
+    async (status) => {
+      const events: string[] = [];
+      const request = createClientRequest(true, events);
+      const response = createIncomingResponse();
+      response.headers = { "content-type": "application/json" };
+      response.statusCode = status;
+      const destroy = vi.spyOn(response, "destroy");
+      let respond: ((response: http.IncomingMessage) => void) | undefined;
+      vi.spyOn(http, "request").mockImplementation((_options, callback) => {
+        respond = callback;
+        return request;
+      });
+      const input = requestInput();
+      const forwarding = serverModule.forwardToInternalHttp(
+        input.ws,
+        input.request,
+        input.body,
+        "error-cleanup"
+      );
+      respond?.(response);
+      response.emit("data", Buffer.from('{"error":{"message":"rejected request"}}'));
+      response.emit("end");
+      await forwarding;
+      expect(request.destroyed).toBe(true);
+      expect(destroy).toHaveBeenCalledOnce();
+      expect(input.ws.close).not.toHaveBeenCalled();
+      expect(JSON.parse(input.ws.send.mock.calls[0][0])).toMatchObject({ type: "error", status });
+    }
+  );
+
+  it("force-settles after upload completion and destroys a late response", async () => {
+    const events: string[] = [];
+    const request = createClientRequest(true, events);
+    const response = createIncomingResponse();
+    const destroy = vi.spyOn(response, "destroy");
+    let respond: ((response: http.IncomingMessage) => void) | undefined;
+    vi.spyOn(http, "request").mockImplementation((_options, callback) => {
+      respond = callback;
+      return request;
+    });
+    let settle!: () => boolean;
+    const input = requestInput();
+    const forwarding = serverModule.forwardToInternalHttp(
+      input.ws,
+      input.request,
+      input.body,
+      "late-response",
+      (_req, _res, finish) => {
+        settle = finish!;
+        return true;
+      }
+    );
+    expect(events).toEqual(["write", "end"]);
+    expect(settle()).toBe(true);
+    expect(settle()).toBe(false);
+    await forwarding;
+    expect(request.destroyed).toBe(true);
+    respond?.(response);
+    expect(destroy).toHaveBeenCalledOnce();
+    expect(input.ws.send).not.toHaveBeenCalled();
+  });
+
+  it("force-settles an active response and tolerates synchronous destroy reentry", async () => {
+    const events: string[] = [];
+    const request = createClientRequest(true, events);
+    const response = createIncomingResponse();
+    vi.spyOn(response, "destroy").mockImplementation(() => {
+      response.destroyed = true;
+      response.emit("error", new Error("destroy reentry"));
+      response.emit("close");
+      return response;
+    });
+    let respond: ((response: http.IncomingMessage) => void) | undefined;
+    vi.spyOn(http, "request").mockImplementation((_options, callback) => {
+      respond = callback;
+      return request;
+    });
+    let settle!: () => boolean;
+    const input = requestInput();
+    const forwarding = serverModule.forwardToInternalHttp(
+      input.ws,
+      input.request,
+      input.body,
+      "response-force",
+      (_req, _res, finish) => {
+        settle = finish!;
+        return true;
+      }
+    );
+    respond?.(response);
+    expect(settle()).toBe(true);
+    await forwarding;
+    expect(request.destroyed).toBe(true);
+    expect(response.destroyed).toBe(true);
+    expect(input.ws.send).not.toHaveBeenCalled();
+  });
+
+  it("force-settles a fatal request error while its terminal callback is pending", async () => {
+    const request = createClientRequest(true, []);
+    vi.spyOn(http, "request").mockImplementation(() => request);
+    const input = requestInput();
+    input.ws.send = vi.fn();
+    let settle!: () => boolean;
+    const forwarding = serverModule.forwardToInternalHttp(
+      input.ws,
+      input.request,
+      input.body,
+      "fatal-wait",
+      (_req, _res, finish) => {
+        settle = finish!;
+        return true;
+      }
+    );
+    request.emit("error", new Error("ECONNRESET"));
+    expect(input.ws.send).toHaveBeenCalledOnce();
+    expect(settle()).toBe(true);
+    await forwarding;
+    expect(settle()).toBe(false);
+    // Simulate the abandoned callback's failure so its deadline is cleared.
+    input.ws.send.mock.calls[0][1]?.(new Error("socket closed"));
+  });
+
+  it.each(["close", "timeout"])(
+    "force-settles upload %s while a fatal send is pending",
+    async (mode) => {
+      vi.useFakeTimers();
+      const request = createClientRequest(false, []);
+      vi.spyOn(http, "request").mockImplementation(() => request);
+      const input = requestInput();
+      input.ws.send = vi.fn();
+      let settle!: () => boolean;
+      const forwarding = serverModule.forwardToInternalHttp(
+        input.ws,
+        input.request,
+        input.body,
+        "upload-fatal",
+        (_req, _res, finish) => {
+          settle = finish!;
+          return true;
+        }
+      );
+      if (mode === "close") request.emit("close");
+      else await vi.advanceTimersByTimeAsync(30_000);
+      expect(input.ws.send).toHaveBeenCalledOnce();
+      expect(settle()).toBe(true);
+      await forwarding;
+      input.ws.send.mock.calls[0][1]?.(new Error("socket closed"));
+      request.emit("drain");
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  );
+
+  it("settles when a delta send fails after a request error queued a fatal frame", async () => {
+    vi.useFakeTimers();
+    const events: string[] = [];
+    const request = createClientRequest(true, events);
+    const response = createIncomingResponse();
+    let respond: ((response: http.IncomingMessage) => void) | undefined;
+    vi.spyOn(http, "request").mockImplementation((_options, callback) => {
+      respond = callback;
+      return request;
+    });
+    const input = requestInput();
+    input.ws.send = vi.fn();
+    const close = vi.fn();
+    const forwarding = serverModule.forwardToInternalHttp(
+      input.ws,
+      input.request,
+      input.body,
+      "delta-fatal",
+      undefined,
+      close
+    );
+    respond?.(response);
+    response.emit("data", 'data: {"type":"response.output_text.delta","delta":"a"}\n\n');
+    request.emit("error", new Error("ECONNRESET"));
+    input.ws.send.mock.calls[0][1]?.(new Error("send failed"));
+    await forwarding;
+    expect(close).toHaveBeenCalledOnce();
+    expect(request.destroyed).toBe(true);
+    expect(response.destroyed).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

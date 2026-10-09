@@ -209,6 +209,13 @@ export const EnvSchema = z.object({
   // 响应结束后后台消费者继续持有请求内存的最长宽限（毫秒）。超时后强制归还租约并记录
   // 卡住的所有者标签；实际宽限不会短于 HEDGE_LOSER_DRAIN_TIMEOUT_MS + 30 秒。
   REQUEST_MEMORY_BACKGROUND_GRACE_MS: z.coerce.number().int().min(1000).default(150_000),
+  // 已返回响应的根所有者无读取进展上限；包括未被消费的错误响应和卡住的 read/cancel。
+  REQUEST_MEMORY_RESPONSE_IDLE_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(1000)
+    .max(2_147_483_647)
+    .default(600_000),
 
   // 客户端断线后的 detached stream 使用进程级带权预算；内置 cluster 会先分摊容器总预算。
   DETACHED_STREAM_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(4096).default(64),

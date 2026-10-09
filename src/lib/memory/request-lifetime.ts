@@ -4,6 +4,7 @@ import { logger } from "@/lib/logger";
 import type { MemoryLease } from "./governor";
 
 const DEFAULT_BACKGROUND_GRACE_MS = 150_000;
+const DEFAULT_RESPONSE_IDLE_TIMEOUT_MS = 600_000;
 const LOSER_DRAIN_MARGIN_MS = 30_000;
 
 interface LifetimeStatsState {
@@ -29,6 +30,14 @@ function resolveBackgroundGraceMs(): number {
     );
   } catch {
     return DEFAULT_BACKGROUND_GRACE_MS;
+  }
+}
+
+function resolveResponseIdleTimeoutMs(): number {
+  try {
+    return getEnvConfig().REQUEST_MEMORY_RESPONSE_IDLE_TIMEOUT_MS;
+  } catch {
+    return DEFAULT_RESPONSE_IDLE_TIMEOUT_MS;
   }
 }
 
@@ -217,45 +226,141 @@ function responseOwner(lifetime: RequestMemoryLifetime) {
 }
 
 export async function withRequestMemoryLifetime(
-  operation: () => Promise<Response>
+  operation: () => Promise<Response>,
+  options: { signal?: AbortSignal; responseIdleTimeoutMs?: number } = {}
 ): Promise<Response> {
   const lifetime = new RequestMemoryLifetime();
-  const { token, release } = responseOwner(lifetime);
+  const { token, release: releaseRoot } = responseOwner(lifetime);
   return storage.run(lifetime, async () => {
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    let ended = false;
+    let abandoned = false;
+    let abandonReason: unknown;
+    let cancellation: Promise<void> | null = null;
+    const idleTimeoutMs = Math.max(
+      1000,
+      options.responseIdleTimeoutMs ?? resolveResponseIdleTimeoutMs()
+    );
+    const release = () => {
+      if (ended) return;
+      ended = true;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = null;
+      options.signal?.removeEventListener("abort", onAbort);
+      controller = null;
+      releaseRoot();
+    };
+    const cancelSource = (reason: unknown): Promise<void> => {
+      if (cancellation) return cancellation;
+      const source = reader;
+      reader = null;
+      if (!source) return Promise.resolve();
+      // A source's cancel hook may itself hang. End the root immediately but
+      // retain the real consumer until it exits (or the background grace ends).
+      const releaseCancel = lifetime.retain("response-source-cancel");
+      cancellation = (async () => {
+        try {
+          await source.cancel(reason);
+        } finally {
+          try {
+            source.releaseLock();
+          } finally {
+            releaseCancel();
+          }
+        }
+      })();
+      // Abort/timeout paths are intentionally fire-and-forget; downstream
+      // cancellation still receives the original rejection.
+      void cancellation.catch(() => undefined);
+      return cancellation;
+    };
+    const abandonResponse = (reason: unknown) => {
+      if (abandoned || ended) return;
+      abandoned = true;
+      abandonReason = reason;
+      controller?.error(reason);
+      void cancelSource(reason);
+      release();
+    };
+    const onAbort = () =>
+      abandonResponse(options.signal?.reason ?? new DOMException("Client aborted", "AbortError"));
+    const armIdleTimer = () => {
+      if (ended) return;
+      if (idleTimer) {
+        idleTimer.refresh();
+        return;
+      }
+      idleTimer = setTimeout(() => {
+        logger.warn("[RequestMemory] Response owner idle timeout; cancelling response source", {
+          idleTimeoutMs,
+        });
+        abandonResponse(new DOMException("Response owner idle timeout", "TimeoutError"));
+      }, idleTimeoutMs);
+      idleTimer.unref?.();
+    };
+    // An abort before the handler returns must not free allocations still used
+    // by that handler. Treat it as a draining consumer with the same grace.
+    const releaseOperation = lifetime.retain("response-operation");
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
     try {
-      const response = await operation();
+      let response: Response;
+      try {
+        response = await operation();
+        if (abandoned && response.body) {
+          reader = response.body.getReader();
+          void cancelSource(abandonReason);
+        }
+      } finally {
+        releaseOperation();
+      }
       if (!response.body) {
         release();
         return response;
       }
-      const reader = response.body.getReader();
+      if (!abandoned) reader = response.body.getReader();
       const wrapped = new Response(
         new ReadableStream<Uint8Array>(
           {
-            pull(controller) {
+            start(streamController) {
+              controller = streamController;
+              if (abandoned) {
+                streamController.error(abandonReason);
+                controller = null;
+              } else armIdleTimer();
+            },
+            pull(streamController) {
               return storage.run(lifetime, async () => {
+                const source = reader;
+                if (!source || ended) return;
                 try {
-                  const result = await reader.read();
+                  const result = await source.read();
+                  if (ended) return;
                   if (result.done) {
-                    reader.releaseLock();
+                    reader = null;
+                    source.releaseLock();
                     release();
-                    controller.close();
-                  } else controller.enqueue(result.value);
+                    streamController.close();
+                  } else {
+                    if (result.value.byteLength > 0) armIdleTimer();
+                    streamController.enqueue(result.value);
+                  }
                 } catch (error) {
-                  reader.releaseLock();
+                  if (ended) return;
+                  reader = null;
+                  source.releaseLock();
                   release();
-                  controller.error(error);
+                  streamController.error(error);
                 }
               });
             },
             cancel(reason) {
-              return storage.run(lifetime, async () => {
-                try {
-                  await reader.cancel(reason);
-                } finally {
-                  reader.releaseLock();
-                  release();
-                }
+              return storage.run(lifetime, () => {
+                const cancelled = cancelSource(reason);
+                release();
+                return cancelled;
               });
             },
           },
@@ -264,7 +369,7 @@ export async function withRequestMemoryLifetime(
         { status: response.status, statusText: response.statusText, headers: response.headers }
       );
       // 框架可能仅转交 body 并重建 Response；GC 兜底必须跟随仍被读取的流。
-      abandonedResponses.register(wrapped.body!, release, token);
+      if (!ended) abandonedResponses.register(wrapped.body!, releaseRoot, token);
       return wrapped;
     } catch (error) {
       release();

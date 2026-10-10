@@ -524,6 +524,17 @@ export async function tryResponsesWebsocketUpstream(options: {
         // terminal event instead of replacing the in-flight session in the map.
         canRetainFreshSession = false;
       } else if (existing.fingerprint === fingerprint && !isWsClosingOrClosed(existing.ws)) {
+        if (
+          options.body.store === false &&
+          continuation &&
+          existing.responseId !== options.body.previous_response_id
+        ) {
+          return {
+            failed: true,
+            reason: "ws_continuation_unavailable",
+            cacheableAsUnsupported: false,
+          };
+        }
         persistentEntry = existing;
         persistentEntry.active = true;
         persistentEntry.lastUsedAt = Date.now();
@@ -1016,8 +1027,8 @@ export async function tryResponsesWebsocketUpstream(options: {
       text = JSON.stringify(normalized);
     } else if (
       continuation &&
-      normalized?.type === "error" &&
-      normalized.error?.code === "previous_response_not_found"
+      (normalized?.type === "error" || normalized?.type === "response.failed") &&
+      (normalized.error ?? normalized.response?.error)?.code === "previous_response_not_found"
     ) {
       await onContinuationRecovery?.();
     }

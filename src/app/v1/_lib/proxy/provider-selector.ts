@@ -22,9 +22,14 @@ import { findAllProviders, findProviderById } from "@/repository/provider";
 import { getGroupCostMultiplier } from "@/repository/provider-groups";
 import type { ProviderChainItem } from "@/types/message";
 import type { Provider } from "@/types/provider";
+import { hasResponsesWsContinuation } from "../responses-ws/continuation";
 import { isResponsesWsContinuationRequest } from "../responses-ws/continuation-routing";
 import { getResponsesWsSessionId } from "../responses-ws/eligibility";
 import { getResponsesWsRecoveryExcludedProviderIds } from "../responses-ws/recovery-state";
+import {
+  getResponsesContinuationOwner,
+  responsesProviderCredentialFingerprint,
+} from "../responses-ws/response-ownership";
 import { getResponsesWsContinuationRoute } from "../responses-ws/upstream-adapter";
 import { type AffinityLookupResult, getAffinityStore } from "./affinity/affinity-store";
 import { isAffinityRoutingEnabledWith } from "./affinity/config";
@@ -203,26 +208,67 @@ export class ProxyProviderResolver {
     // 动态尝试所有可用供应商（避免无限循环通过 excludedProviders 和 null 返回）
     const excludedProviders = await getResponsesWsRecoveryExcludedProviderIds(session);
     const recoveringFullContext =
-      excludedProviders.length > 0 &&
-      !isResponsesWsContinuationRequest(session.headers, session.request.message);
+      excludedProviders.length > 0 && !hasResponsesWsContinuation(session.request.message);
     if (recoveringFullContext) session.setProvider(null);
 
     const wsContinuation = isResponsesWsContinuationRequest(
       session.headers,
       session.request.message
     );
-    if (wsContinuation) {
+    const continuation =
+      session.originalFormat === "response" && hasResponsesWsContinuation(session.request.message);
+    if (continuation) {
+      session.disableStreamingHedge();
+      const owner = await getResponsesContinuationOwner(
+        session,
+        session.request.message.previous_response_id as string
+      );
+      if (owner) {
+        const provider = await ProxyProviderResolver.validateAffinityCandidate(
+          session,
+          owner.providerId,
+          true
+        );
+        if (
+          !provider ||
+          (owner.credentialFingerprint &&
+            owner.credentialFingerprint !== responsesProviderCredentialFingerprint(provider))
+        )
+          throw new ResponsesWsContinuationError("ws_continuation_provider_unavailable");
+        session.responsesContinuationOwner = owner;
+        session.setProvider(provider);
+        session.addProviderToChain(provider, {
+          reason: "session_reuse",
+          selectionMethod: "session_reuse",
+        });
+        logger.info("ProviderSelector: Pinned Responses continuation to response owner", {
+          providerId: owner.providerId,
+          endpointId: owner.endpointId,
+          transport: owner.transport,
+        });
+      }
+    }
+    if (wsContinuation && session.responsesContinuationOwner?.transport !== "http") {
       session.disableStreamingHedge();
       const route = getResponsesWsContinuationRoute(
         getResponsesWsSessionId(session.headers),
         session.request.message.previous_response_id as string
       );
       if (route) {
-        const provider = await ProxyProviderResolver.validateAffinityCandidate(
-          session,
-          route.providerId,
-          true
-        );
+        if (
+          session.responsesContinuationOwner &&
+          session.responsesContinuationOwner.providerId !== route.providerId
+        ) {
+          throw new ResponsesWsContinuationError("ws_continuation_provider_changed");
+        }
+        const provider =
+          session.responsesContinuationOwner?.providerId === route.providerId
+            ? session.provider
+            : await ProxyProviderResolver.validateAffinityCandidate(
+                session,
+                route.providerId,
+                true
+              );
         if (!provider)
           throw new ResponsesWsContinuationError("ws_continuation_provider_unavailable");
         session.responsesWsContinuationRoute = route;
@@ -265,7 +311,12 @@ export class ProxyProviderResolver {
     }
 
     // === 会话复用（「忽略客户端 Session ID」语义下仅跳过读取；写路径不变）===
-    if (!skipSessionBinding && !session.responsesWsContinuationRoute && !recoveringFullContext) {
+    if (
+      !skipSessionBinding &&
+      !session.responsesWsContinuationRoute &&
+      !session.responsesContinuationOwner &&
+      !recoveringFullContext
+    ) {
       const reusedProvider = await ProxyProviderResolver.findReusable(session);
       if (reusedProvider) {
         session.setProvider(reusedProvider);
@@ -375,7 +426,7 @@ export class ProxyProviderResolver {
         );
 
         if (!checkResult.allowed) {
-          if (session.responsesWsContinuationRoute) {
+          if (session.responsesWsContinuationRoute || session.responsesContinuationOwner) {
             throw new ResponsesWsContinuationError("ws_continuation_provider_busy");
           }
           // === 并发限制失败 ===

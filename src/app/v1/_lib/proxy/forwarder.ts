@@ -88,6 +88,10 @@ import { RESERVED_INTERNAL_HEADERS } from "../responses-ws/internal-secret";
 import { shouldReconnectResponsesWs } from "../responses-ws/reconnect-policy";
 import { shouldRecoverResponsesWsFailure } from "../responses-ws/recovery-policy";
 import { rememberResponsesWsRecoveryFailure } from "../responses-ws/recovery-state";
+import {
+  captureResponsesContinuationOwner,
+  responsesProviderCredentialFingerprint,
+} from "../responses-ws/response-ownership";
 import { getResponsesWsFirstEventTimeoutMs } from "../responses-ws/timeout-policy";
 import { markResponsesWsUnsupported } from "../responses-ws/unsupported-cache";
 import { tryResponsesWebsocketUpstream } from "../responses-ws/upstream-adapter";
@@ -1681,6 +1685,7 @@ function applyClaudeMetadataUserIdInjectionWithAudit(
 
 export class ProxyForwarder {
   static async send(session: ProxySession): Promise<Response> {
+    session.responsesContinuationDispatched = false;
     try {
       return await ProxyForwarder.sendInternal(session);
     } catch (error) {
@@ -1690,15 +1695,7 @@ export class ProxyForwarder {
           error instanceof ResponsesWsContinuationError
             ? error
             : new ResponsesWsContinuationError("ws_provider_failure");
-        const lostWithoutDispatch =
-          error instanceof ResponsesWsContinuationError &&
-          [
-            "ws_continuation_unavailable",
-            "ws_module_unavailable",
-            "setting_disabled",
-            "provider_not_codex",
-          ].includes(error.reason);
-        if (session.provider && !lostWithoutDispatch) {
+        if (session.provider && session.responsesContinuationDispatched) {
           await rememberResponsesWsRecoveryFailure(session, session.provider.id);
         }
         logger.info("ProxyForwarder: Recovering failed WS continuation with full context", {
@@ -1725,8 +1722,13 @@ export class ProxyForwarder {
       session.headers,
       session.request.message
     );
-    if (wsContinuation) session.disableStreamingHedge();
-    const continuationRoute = session.responsesWsContinuationRoute;
+    const continuation =
+      wsContinuation ||
+      (session.originalFormat === "response" &&
+        hasResponsesWsContinuation(session.request.message));
+    if (continuation) session.disableStreamingHedge();
+    const continuationRoute =
+      session.responsesWsContinuationRoute ?? session.responsesContinuationOwner;
     if (continuationRoute && continuationRoute.providerId !== session.provider.id) {
       throw new ResponsesWsContinuationError("ws_continuation_provider_changed");
     }
@@ -1821,7 +1823,7 @@ export class ProxyForwarder {
     const rawCrossProviderFallbackEnabled = session.isRawCrossProviderFallbackEnabled();
     const endpointPolicy = ProxyForwarder.getEndpointPolicy(session);
     const shouldSkipRawRetryAndProviderSwitch =
-      wsContinuation || (!endpointPolicy.allowRetry && !rawCrossProviderFallbackEnabled);
+      continuation || (!endpointPolicy.allowRetry && !rawCrossProviderFallbackEnabled);
 
     let lastError: Error | null = null;
     let currentProvider = session.provider;
@@ -1837,7 +1839,7 @@ export class ProxyForwarder {
         currentProvider,
         envDefaultMaxAttempts
       );
-      if (rawCrossProviderFallbackEnabled || wsContinuation) {
+      if (rawCrossProviderFallbackEnabled || continuation) {
         maxAttemptsPerProvider = 1;
       }
       const reactiveRectifierRetryState: ReactiveRectifierRetryState = {
@@ -3118,7 +3120,7 @@ export class ProxyForwarder {
 
             if (
               !isMcpRequest &&
-              !wsContinuation &&
+              !continuation &&
               statusCode === 524 &&
               currentProvider.providerVendorId &&
               endpointCandidateKeys.size > 0 &&
@@ -3276,7 +3278,7 @@ export class ProxyForwarder {
       } // ========== 内层循环结束 ==========
 
       // ========== 供应商切换逻辑 ==========
-      if (wsContinuation) {
+      if (continuation) {
         throw lastError ?? new ResponsesWsContinuationError("ws_continuation_unavailable");
       }
       const alternativeProvider = await ProxyForwarder.selectAlternative(
@@ -3392,6 +3394,11 @@ export class ProxyForwarder {
       throw new Error("Provider is required");
     }
     session.upstreamTransport = null;
+    const originalDispatch = onUpstreamDispatch;
+    onUpstreamDispatch = () => {
+      session.responsesContinuationDispatched = true;
+      originalDispatch?.();
+    };
     const retainForwardedBody = session.shouldPersistSessionDebugArtifacts() || isLangfuseEnabled();
 
     const resolvedCacheTtl = resolveCacheTtlPreference(
@@ -4202,11 +4209,14 @@ export class ProxyForwarder {
       let responsesWsContinuation = false;
       let responsesWsContinuationChecked = false;
       try {
-        const wsEligibility = await evaluateResponsesWsEligibility({
-          headers: session.headers,
-          provider,
-          endpointId: responsesWsEndpointId,
-        });
+        const wsEligibility =
+          session.responsesContinuationOwner?.transport === "http"
+            ? { isWebsocketClient: false, eligible: false }
+            : await evaluateResponsesWsEligibility({
+                headers: session.headers,
+                provider,
+                endpointId: responsesWsEndpointId,
+              });
 
         const requestBodyJson =
           wsEligibility.isWebsocketClient || wsEligibility.eligible
@@ -4926,7 +4936,13 @@ export class ProxyForwarder {
       cleanupCombinedSignal();
     };
 
-    return response;
+    return captureResponsesContinuationOwner(session, response, {
+      providerId: provider.id,
+      endpointId: endpointAudit?.endpointId ?? null,
+      baseUrl: baseUrl || provider.url,
+      transport: session.upstreamTransport ?? "http",
+      credentialFingerprint: responsesProviderCredentialFingerprint(provider),
+    });
   }
 
   /**
@@ -4963,7 +4979,11 @@ export class ProxyForwarder {
 
   private static shouldUseStreamingHedge(session: ProxySession): boolean {
     const endpointPolicy = ProxyForwarder.getEndpointPolicy(session);
-    if (isResponsesWsContinuationRequest(session.headers, session.request.message)) return false;
+    if (
+      isResponsesWsContinuationRequest(session.headers, session.request.message) ||
+      session.responsesContinuationOwner
+    )
+      return false;
     if (session.isStreamingHedgeDisabled()) {
       return false;
     }

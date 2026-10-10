@@ -159,6 +159,80 @@ function readBodyText(body: BodyInit | undefined): string | null {
 }
 
 describe("ProxyForwarder raw passthrough regression", () => {
+  it("records an HTTP fallback reply and keeps its WS-client delta on the same HTTP account", async () => {
+    const { getResponsesContinuationOwner, clearResponsesContinuationOwnersForTests } =
+      await import("@/app/v1/_lib/responses-ws/response-ownership");
+    clearResponsesContinuationOwnersForTests();
+    const provider = createProvider();
+    const policy = resolveEndpointPolicy("/v1/responses");
+    const first = createRawPassthroughSession(
+      JSON.stringify({ model: "gpt-5.5", input: "full", store: false })
+    );
+    Object.assign(first, {
+      requestUrl: new URL("https://proxy.example/v1/responses"),
+      endpointPolicy: policy,
+      getEndpointPolicy: () => policy,
+      originalFormat: "response",
+      authState: { success: true, key: { id: 5 }, user: null },
+    });
+    mocks.evaluateResponsesWsEligibility.mockResolvedValue({
+      isWebsocketClient: true,
+      eligible: true,
+    });
+    mocks.tryResponsesWebsocketUpstream.mockResolvedValue({
+      failed: true,
+      reason: "ws_closed_before_first_event",
+      cacheableAsUnsupported: false,
+    });
+    const fetch = vi.spyOn(ProxyForwarder as any, "fetchWithoutAutoDecode").mockResolvedValue(
+      Response.json({
+        object: "response",
+        id: "resp_http_owner",
+        status: "completed",
+        output: [],
+      })
+    );
+    const { doForward } = ProxyForwarder as unknown as {
+      doForward: (session: ProxySession, provider: Provider, baseUrl: string) => Promise<Response>;
+    };
+    await (await doForward(first, provider, provider.url)).text();
+    const owner = await getResponsesContinuationOwner(first, "resp_http_owner");
+    expect(owner).toMatchObject({
+      providerId: provider.id,
+      baseUrl: provider.url,
+      transport: "http",
+    });
+    const next = createRawPassthroughSession(
+      JSON.stringify({
+        model: "gpt-5.5",
+        previous_response_id: "resp_http_owner",
+        input: "delta",
+        store: false,
+      })
+    );
+    Object.assign(next, {
+      requestUrl: first.requestUrl,
+      endpointPolicy: policy,
+      getEndpointPolicy: () => policy,
+      originalFormat: "response",
+      authState: first.authState,
+      responsesContinuationOwner: owner,
+    });
+    const attempts = mocks.tryResponsesWebsocketUpstream.mock.calls.length;
+    fetch.mockResolvedValueOnce(
+      Response.json({ object: "response", id: "resp_next", status: "completed", output: [] })
+    );
+    await (await doForward(next, provider, provider.url)).text();
+    expect(mocks.tryResponsesWebsocketUpstream).toHaveBeenCalledTimes(attempts);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(next.upstreamTransport).toBe("http");
+    expect(await getResponsesContinuationOwner(next, "resp_next")).toMatchObject({
+      providerId: provider.id,
+      transport: "http",
+    });
+    clearResponsesContinuationOwnersForTests();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     clearResponsesWsUnsupportedCache();

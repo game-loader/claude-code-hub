@@ -116,6 +116,11 @@ vi.mock("@/lib/config/env.schema", async (importOriginal) => {
 
 import { ProxyProviderResolver } from "@/app/v1/_lib/proxy/provider-selector";
 import {
+  rememberResponsesContinuationOwner,
+  clearResponsesContinuationOwnersForTests,
+  responsesProviderCredentialFingerprint,
+} from "@/app/v1/_lib/responses-ws/response-ownership";
+import {
   clearResponsesWsRecoveryStateForTests,
   rememberResponsesWsRecoveryFailure,
 } from "@/app/v1/_lib/responses-ws/recovery-state";
@@ -196,6 +201,7 @@ function makeSession(overrides: Record<string, unknown> = {}): any {
 beforeEach(() => {
   vi.clearAllMocks();
   clearResponsesWsRecoveryStateForTests();
+  clearResponsesContinuationOwnersForTests();
   envControl.affinityEnabled = true;
   settingsControl.ignoreClientSessionId = true;
   storeMocks.lookup.mockResolvedValue(null);
@@ -465,6 +471,157 @@ describe("Responses WS continuation routing", () => {
     expect(await ProxyProviderResolver.ensure(session)).toBeNull();
     expect(session.provider.id).toBe(727);
     expect(session.disableStreamingHedge).toHaveBeenCalled();
+  });
+});
+
+describe("HTTP and fallback reply ownership beats prefix affinity", () => {
+  function request(headers = new Headers()) {
+    return makeSession({
+      originalFormat: "response",
+      headers,
+      sessionId: "changed-thread",
+      getOriginalModel: () => "gpt-5.5",
+      disableStreamingHedge: vi.fn(),
+      request: {
+        message: {
+          model: "gpt-5.5",
+          previous_response_id: "resp_opai",
+          store: false,
+          input: [{ type: "function_call_output", call_id: "call_1", output: "delta" }],
+        },
+      },
+      getProvidersSnapshot: vi.fn(async () => [
+        makeProvider(647, { providerType: "codex", priority: 0 }),
+      ]),
+    });
+  }
+  test.each([false, true])(
+    "pins a known reply ahead of shallow q647 affinity (ignore session=%s)",
+    async (ignore) => {
+      settingsControl.ignoreClientSessionId = ignore;
+      const session = request();
+      const source = makeProvider(792, {
+        providerType: "codex",
+        priority: 1,
+        disableSessionReuse: true,
+      });
+      providerRepositoryMocks.findProviderById.mockImplementation(async (id) =>
+        id === 792 ? source : makeProvider(id, { providerType: "codex" })
+      );
+      sessionManagerMocks.SessionManager.getSessionProvider.mockResolvedValue(647);
+      storeMocks.lookup.mockResolvedValue({
+        generation: "1",
+        hint: { providerId: 647, matchedFp: "shallow", matchedIndex: 0 },
+      });
+      const route = {
+        providerId: 792,
+        endpointId: 42,
+        baseUrl: "https://opai.example/v1",
+        transport: "http" as const,
+      };
+      await rememberResponsesContinuationOwner(session, "resp_opai", route);
+      expect(await ProxyProviderResolver.ensure(session)).toBeNull();
+      expect(session.provider.id).toBe(792);
+      expect(session.responsesContinuationOwner).toEqual(route);
+      expect(storeMocks.lookup).not.toHaveBeenCalled();
+      expect(sessionManagerMocks.SessionManager.getSessionProvider).not.toHaveBeenCalled();
+      expect(session.getProvidersSnapshot).not.toHaveBeenCalled();
+      expect(session.disableStreamingHedge).toHaveBeenCalled();
+    }
+  );
+  test("keeps an HTTP-fallback owner on a trusted WS continuation with store=false", async () => {
+    const headers = new Headers({
+      "x-cch-client-transport": "websocket",
+      "x-cch-responses-ws-forward": "1",
+      "x-cch-internal-secret": ensureInternalSecret(),
+      "x-cch-responses-ws-session": "new-client-socket",
+    });
+    const session = request(headers);
+    providerRepositoryMocks.findProviderById.mockResolvedValue(
+      makeProvider(792, { providerType: "codex" })
+    );
+    await rememberResponsesContinuationOwner(session, "resp_opai", {
+      providerId: 792,
+      endpointId: 42,
+      baseUrl: "https://opai.example/v1",
+      transport: "http",
+    });
+    expect(await ProxyProviderResolver.ensure(session)).toBeNull();
+    expect(session.provider.id).toBe(792);
+    expect(session.responsesWsContinuationErrorReason).toBeUndefined();
+    expect(wsMocks.route).not.toHaveBeenCalled();
+  });
+  test("validates a shared WS owner once before using its exact retained socket", async () => {
+    const headers = new Headers({
+      "x-cch-client-transport": "websocket",
+      "x-cch-responses-ws-forward": "1",
+      "x-cch-internal-secret": ensureInternalSecret(),
+      "x-cch-responses-ws-session": "client-socket",
+    });
+    const session = request(headers);
+    const route = { providerId: 792, endpointId: 42, baseUrl: "https://opai.example/v1" };
+    wsMocks.route.mockReturnValue(route);
+    providerRepositoryMocks.findProviderById.mockResolvedValue(
+      makeProvider(792, { providerType: "codex" })
+    );
+    await rememberResponsesContinuationOwner(session, "resp_opai", {
+      ...route,
+      transport: "websocket",
+    });
+    expect(await ProxyProviderResolver.ensure(session)).toBeNull();
+    expect(session.responsesWsContinuationRoute).toEqual(route);
+    expect(rateLimitMocks.RateLimitService.checkCostLimitsWithLease).toHaveBeenCalledOnce();
+    expect(session.getProvidersSnapshot).not.toHaveBeenCalled();
+  });
+  test.each(["disabled", "credentials", "cost", "busy"])(
+    "does not reroute a pinned reply when its owner is %s",
+    async (mode) => {
+      const session = request();
+      const source = makeProvider(792, {
+        providerType: "codex",
+        key: "original",
+        isEnabled: mode !== "disabled",
+      });
+      const credentialFingerprint = responsesProviderCredentialFingerprint(source);
+      if (mode === "credentials") source.key = "rotated";
+      providerRepositoryMocks.findProviderById.mockResolvedValue(source);
+      if (mode === "cost")
+        rateLimitMocks.RateLimitService.checkCostLimitsWithLease.mockResolvedValue({
+          allowed: false,
+        });
+      if (mode === "busy")
+        rateLimitMocks.RateLimitService.checkAndTrackProviderSession.mockResolvedValue({
+          allowed: false,
+          count: 5,
+          tracked: false,
+          referenced: false,
+        });
+      await rememberResponsesContinuationOwner(session, "resp_opai", {
+        providerId: 792,
+        endpointId: null,
+        baseUrl: "https://opai.example/v1",
+        transport: "http",
+        credentialFingerprint,
+      });
+      await expect(ProxyProviderResolver.ensure(session)).rejects.toMatchObject({
+        name: "ResponsesWsContinuationError",
+      });
+      expect(session.getProvidersSnapshot).not.toHaveBeenCalled();
+      expect(storeMocks.lookup).not.toHaveBeenCalled();
+    }
+  );
+  test("never uses another API key's reply ownership", async () => {
+    const session = request();
+    await rememberResponsesContinuationOwner(session, "resp_opai", {
+      providerId: 792,
+      endpointId: null,
+      baseUrl: "https://opai.example/v1",
+      transport: "http",
+    });
+    session.authState.key.id = 6;
+    expect(await ProxyProviderResolver.ensure(session)).toBeNull();
+    expect(session.provider.id).toBe(647);
+    expect(session.responsesContinuationOwner).toBeUndefined();
   });
 });
 

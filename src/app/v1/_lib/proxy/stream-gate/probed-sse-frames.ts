@@ -35,9 +35,10 @@ export class ProbedSseFrames {
   constructor(
     private readonly family: ProtocolFamily,
     private readonly cap: number,
-    private readonly reserveDepth?: (bytes: number) => void
+    reserveDepth?: (bytes: number) => void,
+    private readonly probeFactory = () => createFrameProbe(family, reserveDepth)
   ) {
-    this.probe = createFrameProbe(family, reserveDepth);
+    this.probe = this.probeFactory();
   }
 
   visit(chunk: Uint8Array, visitor: SseFrameVisitor): boolean {
@@ -207,7 +208,7 @@ export class ProbedSseFrames {
     this.trailingBytes = 0;
     this.preview = "";
     this.inferencePreview = "";
-    this.probe = createFrameProbe(this.family, this.reserveDepth);
+    this.probe = this.probeFactory();
     return keepGoing;
   }
 }

@@ -66,7 +66,8 @@ export class JsonProbe {
 
   constructor(
     private readonly spec: ProbeSpec,
-    private readonly reserveDepth?: (bytes: number) => void
+    private readonly reserveDepth?: (bytes: number) => void,
+    private readonly textLimit = 128
   ) {}
 
   feed(text: string): void {
@@ -107,7 +108,7 @@ export class JsonProbe {
         } else if (c === "\\") this.escape = true;
         else if (c === '"') {
           this.token = null;
-          const value = this.tokenLength > 128 ? "\u0000long" : this.tokenText;
+          const value = this.tokenLength > this.textLimit ? "\u0000long" : this.tokenText;
           if (this.keyToken) {
             const parent = this.stack[this.stack.length - 1];
             parent.key = value;
@@ -249,7 +250,7 @@ export class JsonProbe {
 
   private append(c: string): void {
     this.tokenLength += c.length;
-    if (this.tokenText.length < 128) this.tokenText += c;
+    if (this.tokenText.length < this.textLimit) this.tokenText += c;
   }
   private startString(key: boolean, spec?: ProbeSpec): void {
     this.token = "string";

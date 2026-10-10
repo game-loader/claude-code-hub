@@ -1136,6 +1136,75 @@ describe("tryResponsesWebsocketUpstream", () => {
     expect(receivedFrames[1]?.previous_response_id).toBe("resp_1");
   });
 
+  it("refuses an unstored ID which no longer belongs to the retained socket before dispatch", async () => {
+    let messages = 0;
+    server = await startMockServer((socket) => {
+      socket.on("message", () => {
+        messages++;
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_owned" } }));
+      });
+    });
+    const common = {
+      provider: codexProvider(),
+      upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+      upstreamHeaders: new Headers(),
+      sessionId: "ownership-race",
+    };
+    const first = await tryResponsesWebsocketUpstream({
+      ...common,
+      body: { input: "full", store: false },
+    });
+    if (!("response" in first)) throw new Error("expected first response");
+    await collectSseBody(first.response);
+    const next = await tryResponsesWebsocketUpstream({
+      ...common,
+      body: { input: "delta", store: false, previous_response_id: "resp_unknown" },
+    });
+    expect(next).toMatchObject({ failed: true, reason: "ws_continuation_unavailable" });
+    expect(messages).toBe(1);
+    expect(getResponsesWsContinuationRoute("ownership-race", "resp_owned")).not.toBeNull();
+  });
+
+  it("records recovery once for a nested missing-response terminal", async () => {
+    let messages = 0;
+    server = await startMockServer((socket) => {
+      socket.on("message", () => {
+        const event =
+          ++messages === 1
+            ? { type: "response.completed", response: { id: "resp_owned" } }
+            : {
+                type: "response.failed",
+                response: {
+                  status: "failed",
+                  error: { code: "previous_response_not_found", message: "lost ID" },
+                },
+              };
+        socket.send(JSON.stringify(event));
+      });
+    });
+    const common = {
+      provider: codexProvider(),
+      upstreamUrl: `http://127.0.0.1:${server.port}/v1/responses`,
+      upstreamHeaders: new Headers(),
+      sessionId: "nested-recovery",
+    };
+    const first = await tryResponsesWebsocketUpstream({
+      ...common,
+      body: { input: "full", store: false },
+    });
+    if (!("response" in first)) throw new Error("expected first response");
+    await collectSseBody(first.response);
+    const onContinuationRecovery = vi.fn(async () => {});
+    const next = await tryResponsesWebsocketUpstream({
+      ...common,
+      onContinuationRecovery,
+      body: { input: "delta", store: false, previous_response_id: "resp_owned" },
+    });
+    if (!("response" in next)) throw new Error("expected continuation response");
+    expect(await collectSseBody(next.response)).toContain("previous_response_not_found");
+    expect(onContinuationRecovery).toHaveBeenCalledOnce();
+  });
+
   it.each([
     "missing-session",
     "retention-disabled",

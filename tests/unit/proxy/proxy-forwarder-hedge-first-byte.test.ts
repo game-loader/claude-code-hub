@@ -512,6 +512,51 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
       statusCode: 400,
     });
     expect(doForward).not.toHaveBeenCalled();
+    const { getResponsesWsRecoveryExcludedProviderIds } = await import(
+      "@/app/v1/_lib/responses-ws/recovery-state"
+    );
+    expect(await getResponsesWsRecoveryExcludedProviderIds(session)).toEqual([]);
+  });
+
+  test("pins HTTP continuation endpoint and disables Discovery, hedge and provider switching", async () => {
+    const provider = createProvider({
+      id: 792,
+      providerType: "codex",
+      providerVendorId: 12,
+      firstByteTimeoutStreamingMs: 10,
+    });
+    const session = createSession();
+    session.setProvider(provider);
+    session.originalFormat = "response";
+    session.requestUrl = new URL("https://example.com/v1/responses");
+    session.request.message = {
+      model: "gpt-5.5",
+      stream: true,
+      previous_response_id: "resp_http",
+      input: "delta",
+    };
+    session.responsesContinuationOwner = {
+      providerId: 792,
+      endpointId: 42,
+      baseUrl: "https://opai.example/v1",
+      transport: "http",
+    };
+    mocks.isWebsocketClientRequest.mockReturnValue(false);
+    mocks.getCachedSystemSettings.mockResolvedValue({
+      ...(await mocks.getCachedSystemSettings()),
+      discoveryEnabled: true,
+    });
+    const original = new UpstreamProxyError("owner failed", 502, {
+      providerId: 792,
+      providerName: "opai",
+    });
+    const forward = vi.spyOn(ProxyForwarder as any, "doForward").mockRejectedValue(original);
+    await expect(ProxyForwarder.send(session)).rejects.toBe(original);
+    expect(forward).toHaveBeenCalledOnce();
+    expect(forward.mock.calls[0][2]).toBe("https://opai.example/v1");
+    expect(mocks.getPreferredProviderEndpoints).not.toHaveBeenCalled();
+    expect(mocks.pickDiscoveryProviders).not.toHaveBeenCalled();
+    expect(mocks.pickRandomProviderWithExclusion).not.toHaveBeenCalled();
   });
 
   test.each([524, 502])(
